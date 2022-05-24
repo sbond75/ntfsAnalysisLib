@@ -1,0 +1,1 @@
+sudo runuser -u my_qemu_upstairs_pc_sim -- gdb --batch -ex 'b _close' -ex 'run' -ex 'fin' -ex 'print buf' -ex 'print rec' -ex 'print rec.applyFixup(buf.bytesPerSector)' -ex 'print rec' --args ./a.out /dev/loop3
