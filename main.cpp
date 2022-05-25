@@ -9,6 +9,7 @@
 #include <variant>
 #include "stdvisit_helpers.hpp"
 #include "utils.hpp"
+#include "tools.h"
 
 // Lib //
 
@@ -256,8 +257,47 @@ struct MFTRecord {
   uint32_t numberOfThisMFTRecord; // On Windows XP
   char attributesAndFixupValue[0x1000-0x30]; // Attributes and fixup value
 
+  size_t totalSize() const {
+    return offsetof(MFTRecord, attributesAndFixupValue) + sizeOfAllAttributes() + sizeof(0xffffffff /*end of attributes list marker*/);
+  }
+
+  void hexDump() const {
+    auto size = totalSize();
+    DumpHex(this, size);
+    printf("  \tSize: %ju\n", size);
+  }
+
+  // Returns the sum of all attributes' sizes.
+  size_t sizeOfAllAttributes() const {
+    size_t numAttrs = numAttributes();
+    AttributeBase* currentAttr = (AttributeBase*)((uint8_t*)this + offsetToFirstAttribute);
+    size_t acc = 0;
+    for (size_t i = 0; i < numAttrs; i++) {
+      acc += currentAttr->attributeLength;
+      currentAttr = (AttributeBase*)((uint8_t*)currentAttr + currentAttr->attributeLength);
+    }
+    return acc;
+  }
+  
   size_t numAttributes() const {
-    return nextAttributeID - 1;
+    size_t retval = nextAttributeID - 1;
+    
+    // Find end marker
+    size_t counter = 0;
+    AttributeBase* currentAttr = (AttributeBase*)((uint8_t*)this + offsetToFirstAttribute);
+    while (*(uint16_t*)currentAttr != 0xffffffff // The end marker for attribute list
+	     ) {
+      if (!(counter < retval)) {
+	printf("numAttributes: !( counter < retval)\n");
+	break;
+      }
+      
+      currentAttr = (AttributeBase*)((uint8_t*)currentAttr + currentAttr->attributeLength);
+      counter++;
+    };
+
+    assert(counter == retval);
+    return retval;
   }
 
   bool isBaseRecord() const {
@@ -315,7 +355,7 @@ struct MFTRecord {
     for (size_t i = 0; i < numAttributes(); i++) {
       Attribute attr = makeAttribute(currentAttr);
       ret.push_back(attr);
-      currentAttr = currentAttr + currentAttr->attributeLength;
+      currentAttr = (AttributeBase*)((uint8_t*)currentAttr + currentAttr->attributeLength);
     }
 
     return ret;
@@ -366,6 +406,8 @@ int main(int argc, char** argv) {
 	[](NonResidentAttribute* v){BREAKPOINT;},
       }, v);
   }
+
+  rec.hexDump();
 
   _close(fd);
 }
