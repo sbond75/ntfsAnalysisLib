@@ -118,6 +118,11 @@ struct ArrayWithLength {
   T* array;
   size_t length;
 
+  // Returns the length of the array in bytes.
+  size_t byteLength() const {
+    return length * sizeof(T);
+  }
+
   ArrayWithLengthIterator<T> begin() { return {array, length}; }
   ArrayWithLengthIterator<T> end() { return {array+length, 0}; }
 };
@@ -258,7 +263,12 @@ struct MFTRecord {
   char attributesAndFixupValue[0x1000-0x30]; // Attributes and fixup value
 
   size_t totalSize() const {
-    return offsetof(MFTRecord, attributesAndFixupValue) + sizeOfAllAttributes() + sizeof(0xffffffff /*end of attributes list marker*/);
+    // Wrong size presumably because the fixupArray() is in there too: return offsetof(MFTRecord, attributesAndFixupValue) + sizeOfAllAttributes() + sizeof(0xffffffff /*end of attributes list marker*/);
+
+    size_t ret1 = offsetof(MFTRecord, attributesAndFixupValue) + fixupArray().byteLength() + sizeOfAllAttributes() + sizeof((uint32_t)0xffffffff /*end of attributes list marker*/);
+
+    // NOTE: there seems to also be an extra 0xffff at the end of the record? I will include this for testing..:
+    return ret1 + sizeof((uint16_t)0xffff);
   }
 
   void hexDump() const {
@@ -285,7 +295,7 @@ struct MFTRecord {
     // Find end marker
     size_t counter = 0;
     AttributeBase* currentAttr = (AttributeBase*)((uint8_t*)this + offsetToFirstAttribute);
-    while (*(uint16_t*)currentAttr != 0xffffffff // The end marker for attribute list
+    while (currentAttr->typeIdentifier != 0xffffffff // The end marker for attribute list
 	     ) {
       if (!(counter < retval)) {
 	printf("numAttributes: !( counter < retval)\n");
@@ -296,8 +306,11 @@ struct MFTRecord {
       counter++;
     };
 
-    assert(counter == retval);
-    return retval;
+    printf("numAttributes: counter %ju, retval %ju\n", counter, retval);
+    //assert(counter == retval);
+    //return retval;
+
+    return counter;
   }
 
   bool isBaseRecord() const {
