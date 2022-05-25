@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+
+# https://stackoverflow.com/questions/1262639/multiple-commands-in-gdb-separated-by-some-sort-of-delimiter
+# multiple commands
+
+from sys import argv
+args = " ".join(argv[1:])
+for fragment in args.split(';'):
+  print('-ex "' + fragment.strip() + '"')

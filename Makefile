@@ -1,3 +1,3 @@
 .PHONY: all
 all:
-	g++ -O0 -g3 main.cpp
+	g++ -std=c++17 -O0 -g3 -ggdb3 main.cpp

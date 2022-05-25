@@ -11,8 +11,13 @@
 }) { }}:
 with pkgs;
 
+let
+  my-python-packages = python3Full.withPackages(ps: with ps; [
+  ]);
+in
 mkShell {
   buildInputs = [
+    my-python-packages
     gcc
   ];
 }
