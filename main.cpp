@@ -498,6 +498,25 @@ struct NTFS {
   }
 };
 
+// Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
+template <typename AttributeContentT>
+AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind) {
+  auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind](auto attr){
+    bool ret = false;
+    auto process = [&](auto attr) -> bool {
+      return (attr->base.typeIdentifier == attributeToFind);
+    };
+    ret = std::visit([&](auto v){return process(v);}, attr);
+    return ret;
+  });
+  if (attrOfDesiredType == std::end(attributes)) {
+    return nullptr;
+  }
+  AttributeContent content = std::visit([](auto v){return v->content();}, *attrOfDesiredType); // Get content()
+  AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
+  return desiredType;
+}
+
 // "The second #pragma resets the pack value." ( https://stackoverflow.com/questions/24887459/c-c-struct-packing-not-working )
 #pragma pack()
 
@@ -526,51 +545,21 @@ int main(int argc, char** argv) {
 
 
   // Now that we have the first record, we know it is the $MFT itself (entry 0). So this is a file that references itself! We need to follow its $DATA attribute to get the full MFT contents. ( https://docs.microsoft.com/en-us/windows/win32/devnotes/master-file-table : "The $Mft file contains an unnamed $DATA attribute that is the sequence of MFT record segments, in order." )
-  auto attr_containing_file_name = std::find_if(std::begin(attributes), std::end(attributes), [](auto attr){
-    bool ret = false;
-    auto process = [&ret](auto attr) -> bool {
-      return (attr->base.typeIdentifier == FILE_NAME);
-    };
-    ret = std::visit([&](auto v){return process(v);}, attr);
-    return ret;
-  });
-  if (attr_containing_file_name == std::end(attributes)) {
+  auto file_name = findAttribute<FileName>(attributes, FILE_NAME);
+  if (file_name == nullptr) {
     printf("Can't find $FILE_NAME in first MFT entry.\n");
     return 1;
   }
-  AttributeContent content = std::visit([](auto v){return v->content();}, *attr_containing_file_name); // Get content()
-  FileName* file_name = std::get<FileName*>(content); // Unwrap std::variant
   auto arr = file_name->fileNameInUnicode();
   auto str = arr.to_string();
   printf("Found $FILE_NAME in first MFT entry (resident) with file name: %s\n", str.c_str());
 
-  // auto data = std::find_if(std::begin(attributes), std::end(attributes), [](auto attr){
-  //   bool ret = false;
-  //   auto process = [&ret](auto attr) -> bool {
-  //     return (attr->typeIdentifier == DATA);
-  //   };
-  //   std::visit(overloaded{
-  // 	[](std::monostate&) /* Empty variant */ {},
-  // 	[&](ResidentAttribute* v){process(v);},
-  // 	[&](NonResidentAttribute* v){process(v);},
-  //     }, attr);
-  //   return ret;
-  // });
-  // if (data == std::end(attributes)) {
-  //   printf("Can't find $DATA in first MFT entry.\n");
-  //   return 1;
-  // }
-  // std::visit(overloaded{
-  //     [](std::monostate&) /* Empty variant */ {},
-  //     [&](ResidentAttribute* v){
-  // 	AttributeContent content = v->content();
-	
-  //     },
-  //     [&](NonResidentAttribute* v){
-  // 	throw UnhandledValue(); // Not yet implemented
-  //     },
-  //   }, *data);
-  // printf("Found $DATA in first MFT entry\n");
+  auto data = findAttribute<Data>(attributes, DATA);
+  if (data == nullptr) {
+    printf("Can't find $DATA in first MFT entry.\n");
+    return 1;
+  }
+  printf("Found $DATA in first MFT entry\n");
 
   _close(fd);
 }
