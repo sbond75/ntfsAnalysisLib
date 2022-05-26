@@ -10,6 +10,10 @@
 #include "stdvisit_helpers.hpp"
 #include "utils.hpp"
 #include "tools.h"
+#include <algorithm>
+// https://www.cplusplus.com/reference/locale/wstring_convert/
+#include <locale>         // std::wstring_convert
+#include <codecvt>        // std::codecvt_utf8
 
 // Lib //
 
@@ -114,7 +118,7 @@ bool operator!=(ArrayWithLengthIterator<T> o1, ArrayWithLengthIterator<T> o2) {
 }
 
 template <typename T>
-struct ArrayWithLength {
+struct ArrayWithLength_base {
   T* array;
   size_t length;
 
@@ -125,6 +129,57 @@ struct ArrayWithLength {
 
   ArrayWithLengthIterator<T> begin() { return {array, length}; }
   ArrayWithLengthIterator<T> end() { return {array+length, 0}; }
+};
+template <typename T>
+struct ArrayWithLength: ArrayWithLength_base<T> {};
+
+// https://stackoverflow.com/questions/3477525/is-it-possible-to-use-a-c-smart-pointers-together-with-cs-malloc
+struct free_delete
+{
+    void operator()(void* x) { free(x); }
+};
+template <typename T>
+using unique_free = std::unique_ptr<T, free_delete>;
+
+// https://stackoverflow.com/questions/41744559/is-this-a-bug-of-gcc : {"
+// Also see LWG issue 721 [ http://www.open-std.org/jtc1/sc22/wg21/docs/lwg-closed.html#721 ] (decided as Not A Defect).
+//   "This is a regrettable consequence of the original design of the facet."
+// The defect report also has an example of how to construct such object:
+// "}
+template<class I, class E, class S>
+struct codecvt : std::codecvt<I, E, S> { ~codecvt() {} };
+// Usage example: `std::wstring_convert<codecvt<wchar_t, char, std::mbstate_t> >;`
+
+// https://stackoverflow.com/questions/27453449/c-template-partial-specialization-with-inheritance
+template <>
+struct ArrayWithLength<uint16_t>: ArrayWithLength_base<uint16_t> {
+  // unique_free<wchar_t> wstr() const {
+  //   static_assert(sizeof(wchar_t) == sizeof(uint16_t)); // If this fails, use another type instead of wchar_t
+    
+  //   wchar_t* res = malloc(byteLength() + (1*sizeof(wchar_t) /*for null terminator we will add*/));
+  //   memcpy(res, array, byteLength());
+  //   res[byteLength()] = L'\0'; // Null terminate it
+  //   return res;
+  // }
+
+  std::string to_string() const {
+    // Demo: std::string s = u8"Hello, World!";
+    //const char* s = (const char*)array;
+    // #include <codecvt>
+    // `std::codecvt<char16_t, char, std::mbstate_t>` : "conversion between UTF-16 and UTF-8" ( https://en.cppreference.com/w/cpp/locale/codecvt )
+    std::wstring_convert<codecvt<char16_t,char,std::mbstate_t>,char16_t> convert; // https://stackoverflow.com/questions/11086183/encode-decode-stdstring-to-utf-16
+    //std::u16string u16 = convert.from_bytes(s, (const char*)((uint8_t*)array + byteLength())); // Args are: first, last (last is exclusive)
+    //std::string u8 = convert.to_bytes(u16);
+
+    // https://gist.github.com/gchudnov/c1ba72d45e394180e22f
+    std::string u8 = convert.to_bytes((const char16_t*)array, (const char16_t*)((uint8_t*)array + byteLength()));
+    
+    // Fails: static_assert(sizeof(wchar_t) == sizeof(uint16_t)); // If this fails, use another type instead of wchar_t
+    //return std::wstring(array, byteLength());
+
+    return u8;
+  }
+
 };
 
 enum AttributeTypeIdentifier: uint32_t {
@@ -148,14 +203,21 @@ enum AttributeTypeIdentifier: uint32_t {
   LOGGED_UTILITY_STREAM = 0x100 // Windows 2000
 };
 
+// Notes: "Only the data attribute can be compressed, or sparse, and only when it is non-resident." + "Although the compression flag is stored in the header, it does not affect the size of the header." ( ntfsdoc-0.6/concepts/attribute_header.html )
+enum AttributeFlags: uint16_t {
+  AttributeFlags_Compressed = 0x0001,
+  AttributeFlags_Encrypted = 0x4000,
+  AttributeFlags_Sparse = 0x8000
+};
+
 struct AttributeBase {
   AttributeTypeIdentifier typeIdentifier; // "The attribute type identifier determines also the layout of the contents."
   uint32_t attributeLength; // (determines the location of next attribute)
   uint8_t nonResidentFlag;
-  uint8_t lengthOfName;
-  uint16_t offsetToName;
-  uint16_t flags;
-  uint16_t attributeIdentifier;
+  uint8_t lengthOfName; // (Optional, if a name is present then this is a "named attribute" ( ntfsdoc-0.6/concepts/attribute_header.html ))
+  uint16_t offsetToName; // (Optional, same situation as the above)
+  AttributeFlags flags;
+  uint16_t attributeIdentifier; // "Each attribute has a unique identifier" ( ntfsdoc-0.6/concepts/attribute_header.html )
 };
 
 // "The time values are given in 100 nanoseconds since January 1, 1601, UTC."
@@ -176,16 +238,36 @@ struct StandardInformation {
   uint64_t quotaChanged;
   uint64_t usn; // Update Sequence Number (USN)
 };
+enum FileNameFlags: uint32_t {
+  ReadOnly = 0x0001,
+  Hidden = 0x0002,
+  System = 0x0004,
+  Archive = 0x0020,
+  Device = 0x0040,
+  Normal = 0x0080,
+  Temporary = 0x0100,
+  SparseFile = 0x0200,
+  ReparsePoint = 0x0400,
+  Compressed = 0x0800,
+  Offline = 0x1000,
+  NotContentIndexed = 0x2000,
+  Encrypted = 0x4000,
+  FileNameFlags_Directory = 0x10000000, // (copy from corresponding bit in MFT record)
+  IndexView = 0x20000000 // (copy from corresponding bit in MFT record)
+};
+// Misc note: "NTFS implements POSIX-style Hard Links by creating a file with several Filename Attributes. Each Filename Attribute has its own details and parent [fileReferenceToParentDirectory]. When a Hard Linked file is deleted, its filename is removed from the MFT Record. When the last link is removed, then the file is really deleted." ( ntfsdoc-0.6/attributes/file_name.html#file_flags )
 struct FileName {
+  // "N.B. All fields, except the parent directory, are only updated when the filename is changed. Until then, they just become out of date. $STANDARD_INFORMATION Attribute, however, will always be kept up-to-date." ( ntfsdoc-0.6/attributes/file_name.html#file_flags )
+  
   uint64_t fileReferenceToParentDirectory; // This is a "file reference" which has a specific meaning: "A reference consists of a 48-bit index into the mft [numberOfThisMFTRecord] and a 16-bit sequence
   // number [sequenceNumber] used to detect stale references." ( ntfsdoc-0.6/concepts/file_reference.html )
 
   Times times;
-  uint64_t allocatedSizeOfFile;
-  uint64_t realSizeOfFile;
-  uint32_t flags;
-  uint32_t usedBy_EAs_andReparse;
-  uint32_t securityID;
+  uint64_t allocatedSizeOfFile; // "The allocated size of a file is the amount of disk space the file is taking up. It will be a multiple of the cluster size. The real size of the file is the size of the unnamed data attribute. This is the number that will appear in a directory listing." ( ntfsdoc-0.6/attributes/file_name.html )
+  uint64_t realSizeOfFile; // "N.B. The Real Size is only present if the Starting VCN [NonResidentAttribute.startingVirtualClusterNumber] is zero. See the Standard Attribute Header [struct NonResidentAttribute or more generally ResidentAttribute] for more information." ( ntfsdoc-0.6/attributes/file_name.html )
+  FileNameFlags flags;
+  uint32_t usedBy_EAs_andReparse; // "N.B. If the file has EAs (Extended Attributes), then the EA Field will contain the size of buffer needed." + "N.B. If the file is a Reparse Point [FileNameFlags::ReparsePoint], then the Reparse Field will give its type." ( ntfsdoc-0.6/attributes/file_name.html#file_flags )
+  //uint32_t securityID; // <-- doesn't exist?
   uint8_t filenameLengthInUnicodeCharacters;
   uint8_t filenameNamespace;
 
@@ -193,13 +275,33 @@ struct FileName {
     return {(uint16_t*)((uint8_t*)this + sizeof(FileName)), filenameLengthInUnicodeCharacters};
   }
 };
-using AttributeContent = std::variant<StandardInformation*, FileName*>; // Note: there are more than just these
+static_assert(offsetof(FileName, allocatedSizeOfFile) == 0x28);
+static_assert(offsetof(FileName, usedBy_EAs_andReparse) == 0x3c);
+static_assert(sizeof(FileName) == 0x42); // Based on the filename in Unicode being at 0x42 according to ntfsdoc-0.6/attributes/file_name.html where it says "File name in Unicode (not null terminated)"
+struct Data {
+  // Contains anything! For a ResidentAttribute containing this, use `sizeOfContent` to tell how long this Data is. TODO: NonResidentAttribute.
+};
+using AttributeContent = std::variant<StandardInformation*, FileName*, Data*>; // Note: there are more than just these
 
 // Resident = in this MFT. These have a different structure from non-resident ones.
 struct ResidentAttribute {
   AttributeBase base;
   uint32_t sizeOfContent;
   uint16_t offsetToContent;
+  uint8_t indexedFlag; // ntfsdoc-0.6/concepts/attribute_header.html
+  char padding[1]; // ntfsdoc-0.6/concepts/attribute_header.html
+
+  // Returns the attribute name or nullptr if this is not a named attribute.
+  ArrayWithLength<uint16_t> name() {
+    if (base.lengthOfName != 0) {
+      assert(base.offsetToName != 0);
+      return {(uint16_t*)((uint8_t*)this + base.offsetToName), base.lengthOfName};
+    }
+    else {
+      //assert(base.offsetToName == 0);
+      return {nullptr, 0};
+    }
+  }
 
   AttributeContent content() {
     uint8_t* contentPtr = (uint8_t*)this + offsetToContent;
@@ -421,6 +523,54 @@ int main(int argc, char** argv) {
   }
 
   rec.hexDump();
+
+
+  // Now that we have the first record, we know it is the $MFT itself (entry 0). So this is a file that references itself! We need to follow its $DATA attribute to get the full MFT contents. ( https://docs.microsoft.com/en-us/windows/win32/devnotes/master-file-table : "The $Mft file contains an unnamed $DATA attribute that is the sequence of MFT record segments, in order." )
+  auto attr_containing_file_name = std::find_if(std::begin(attributes), std::end(attributes), [](auto attr){
+    bool ret = false;
+    auto process = [&ret](auto attr) -> bool {
+      return (attr->base.typeIdentifier == FILE_NAME);
+    };
+    ret = std::visit([&](auto v){return process(v);}, attr);
+    return ret;
+  });
+  if (attr_containing_file_name == std::end(attributes)) {
+    printf("Can't find $FILE_NAME in first MFT entry.\n");
+    return 1;
+  }
+  AttributeContent content = std::visit([](auto v){return v->content();}, *attr_containing_file_name); // Get content()
+  FileName* file_name = std::get<FileName*>(content); // Unwrap std::variant
+  auto arr = file_name->fileNameInUnicode();
+  auto str = arr.to_string();
+  printf("Found $FILE_NAME in first MFT entry (resident) with file name: %s\n", str.c_str());
+
+  // auto data = std::find_if(std::begin(attributes), std::end(attributes), [](auto attr){
+  //   bool ret = false;
+  //   auto process = [&ret](auto attr) -> bool {
+  //     return (attr->typeIdentifier == DATA);
+  //   };
+  //   std::visit(overloaded{
+  // 	[](std::monostate&) /* Empty variant */ {},
+  // 	[&](ResidentAttribute* v){process(v);},
+  // 	[&](NonResidentAttribute* v){process(v);},
+  //     }, attr);
+  //   return ret;
+  // });
+  // if (data == std::end(attributes)) {
+  //   printf("Can't find $DATA in first MFT entry.\n");
+  //   return 1;
+  // }
+  // std::visit(overloaded{
+  //     [](std::monostate&) /* Empty variant */ {},
+  //     [&](ResidentAttribute* v){
+  // 	AttributeContent content = v->content();
+	
+  //     },
+  //     [&](NonResidentAttribute* v){
+  // 	throw UnhandledValue(); // Not yet implemented
+  //     },
+  //   }, *data);
+  // printf("Found $DATA in first MFT entry\n");
 
   _close(fd);
 }
