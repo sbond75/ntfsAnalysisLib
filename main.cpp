@@ -333,7 +333,7 @@ public:
   AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
 
   template <typename T>
-  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent((T*)other.ptr.get()) {}
+  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent(std::get<T*>(other)) {}
 
   AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
   
@@ -352,7 +352,11 @@ public:
   
   TypedAttributeContentWithFreer(unique_free<T>&& ptr_): ptr(ptr_.release()), ac(ptr_.get()) {}
 
-  TypedAttributeContentWithFreer(TypedAttributeContentWithFreer&& other): ptr(other.ptr.release()), ac((T*)other.ptr.get()) {}
+  TypedAttributeContentWithFreer(TypedAttributeContentWithFreer&& other): ptr(other.ptr.release()) {
+    if (other.ac.has_value()) {
+      ac = std::get<T*>(*other.ac);
+    }
+  }
 
   TypedAttributeContentWithFreer(const TypedAttributeContentWithFreer& other) = delete;
   
@@ -366,7 +370,7 @@ public:
   
   // Similar interface to std::unique_ptr<T> //
 
-  T* get() const { return ac.has_value() ? nullptr : std::get<T*>(*ac); }
+  T* get() const { return ac.has_value() ? std::get<T*>(*ac) : nullptr; }
   
   T& operator* () const
   {
@@ -526,6 +530,7 @@ MyDataRuns LazilyLoaded::loadUpTo(size_t totalOffsetFromStartInClusters) const {
     size_t offset = z.toSizeT();
     z = runList->length();
     size_t length = z.toSizeT();
+    printf("LazilyLoaded::loadUpTo: processing RunList: offset size = %ju, length size = %ju, offset = %ju, length = %ju\n", (uintmax_t)runList->sizeOfOffset(), (uintmax_t)runList->sizeOfLength(), (uintmax_t)offset, (uintmax_t)length);
 
     counter += length;
     offsetCounter += offset;
@@ -702,6 +707,7 @@ struct MFTRecord {
     for (size_t i = 0; i < numAttributes(); i++) {
       Attribute attr = makeAttribute(currentAttr);
       ret.push_back(attr);
+      printf("MFTRecord::attributes: found attribute with type %#jx and offset %#jx from the start of the MFTRecord\n", (uintmax_t)currentAttr->typeIdentifier, (uintmax_t)((uint8_t*)currentAttr - (uint8_t*)this));
       currentAttr = (AttributeBase*)((uint8_t*)currentAttr + currentAttr->attributeLength);
     }
 
@@ -838,10 +844,15 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool
 // Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
 template <typename AttributeContentT>
 TypedAttributeContentWithFreer<AttributeContentT> findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, bool* out_moreNeeded /*for non-resident*/, ssize_t* out_more /*for non-resident*/, int fd, NTFS* ntfs) {
-  auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind](auto attr){
+  uint8_t* attrAddress = nullptr;
+  auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind, &attrAddress](auto attr){
     bool ret = false;
     auto process = [&](auto attr) -> bool {
-      return (attr->base.typeIdentifier == attributeToFind);
+      if (attr->base.typeIdentifier == attributeToFind) {
+	attrAddress = (uint8_t*)attr;
+	return true;
+      }
+      return false;
     };
     ret = std::visit([&](auto v){return process(v);}, attr);
     return ret;
@@ -893,7 +904,7 @@ int main(int argc, char** argv) {
   }
   auto arr = file_name->fileNameInUnicode();
   auto str = arr.to_string();
-  printf("Found $FILE_NAME in first MFT entry (resident) with file name: %s\n", str.c_str());
+  printf("Found $FILE_NAME in first MFT entry with file name: %s\n", str.c_str());
 
   auto data = findAttribute<Data>(attributes, DATA, limitToLoad, &moreNeeded, &more, fd, &buf);
   if (data.get() == nullptr) {
