@@ -19,5 +19,6 @@ mkShell {
   buildInputs = [
     my-python-packages
     gcc
+    gmp
   ];
 }

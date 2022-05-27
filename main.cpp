@@ -14,6 +14,7 @@
 // https://www.cplusplus.com/reference/locale/wstring_convert/
 #include <locale>         // std::wstring_convert
 #include <codecvt>        // std::codecvt_utf8
+#include <gmpxx.h> // C++ API for The GNU Multiple Precision Arithmetic Library (GMP)
 
 // Lib //
 
@@ -72,7 +73,7 @@ int _close(int fd) {
 // Most of this is based on the descriptions on https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html
 
 enum MFTEntryFlags: uint16_t {
-  RecordInUse = 0x01,
+  RecordInUse = 0x01, // If this is set, the entry is *not* deleted. If it is not set, the record can be reused because it points to a deleted file! ("When a file is created, an unused FILE record can be re-used for it, but its sequence number is [if non-zero] incremented by one [and skipping 0]. This mechanism allows NTFS to check that file references don't point to deleted files." -- ntfsdoc-0.6/concepts/file_record.html )
   Directory = 0x02
 };
 
@@ -140,6 +141,21 @@ struct free_delete
 };
 template <typename T>
 using unique_free = std::unique_ptr<T, free_delete>;
+
+// For GMP library-allocated buffers
+template <size_t wordCount, size_t wordSize>
+struct free_mp
+{
+  void operator()(void* outRaw) {
+    // https://stackoverflow.com/questions/51601666/gmp-store-64-bit-interger-in-mpz-t-mpz-class-and-get-64-bit-integers-back
+    // Free the allocated memory by mpz_export
+    void (*freeFunction)(void*, size_t);
+    mp_get_memory_functions(nullptr, nullptr, &freeFunction);
+    freeFunction(outRaw, wordCount * wordSize);
+  }
+};
+template <typename T, size_t wordCount, size_t wordSize>
+using unique_free_mp = std::unique_ptr<T, free_mp<wordCount, wordSize>>;
 
 // https://stackoverflow.com/questions/41744559/is-this-a-bug-of-gcc : {"
 // Also see LWG issue 721 [ http://www.open-std.org/jtc1/sc22/wg21/docs/lwg-closed.html#721 ] (decided as Not A Defect).
@@ -217,7 +233,19 @@ struct AttributeBase {
   uint8_t lengthOfName; // (Optional, if a name is present then this is a "named attribute" ( ntfsdoc-0.6/concepts/attribute_header.html ))
   uint16_t offsetToName; // (Optional, same situation as the above)
   AttributeFlags flags;
-  uint16_t attributeIdentifier; // "Each attribute has a unique identifier" ( ntfsdoc-0.6/concepts/attribute_header.html )
+  uint16_t attributeIdentifier; // "Each attribute has a unique identifier" ( ntfsdoc-0.6/concepts/attribute_header.html ) + "Every Attribute in every FILE Record has an Attribute Id. This Id is unique within the FILE Record and is used to maintain data integrity." ( ntfsdoc-0.6/concepts/attribute_id.html )
+  
+  // Returns the attribute name or nullptr if this is not a named attribute.
+  ArrayWithLength<uint16_t> name() const {
+    if (lengthOfName != 0) {
+      assert(offsetToName != 0);
+      return {(uint16_t*)((uint8_t*)this + offsetToName), lengthOfName};
+    }
+    else {
+      //assert(offsetToName == 0);
+      return {nullptr, 0};
+    }
+  }
 };
 
 // "The time values are given in 100 nanoseconds since January 1, 1601, UTC."
@@ -282,6 +310,39 @@ struct Data {
   // Contains anything! For a ResidentAttribute containing this, use `sizeOfContent` to tell how long this Data is. TODO: NonResidentAttribute.
 };
 using AttributeContent = std::variant<StandardInformation*, FileName*, Data*>; // Note: there are more than just these
+// Contains `ptr` which will be freed and the superclass which holds type info for the `ptr`.
+template <typename T>
+class AttributeContentWithFreer: AttributeContent {
+  unique_free<T> ptr;
+  AttributeContentWithFreer(unique_free<T> ptr_): ptr(ptr_), AttributeContent(ptr_.get()) {}
+};
+struct RunList; struct NTFS;
+
+#pragma pack()
+// Non-NTFS-specific struct
+struct MyDataRun {
+  size_t offset; // Offset in clusters from the start of the volume *or* previous data run's start if there is a previous one.
+  size_t length; // Length in clusters of this run. If this is zero, ignore it.
+};
+#pragma pack(1)
+#pragma pack()
+// Non-NTFS-specific struct
+struct MyDataRuns {
+  std::vector<MyDataRun> dataRuns;
+  bool hasMore; // Whether the last run has more data to it but it wasn't loaded, or there are more runs to be loaded but they weren't loaded.
+
+  // Loads data from the dataRuns' specified offsets and lengths. See the definition of this function for more information.
+  unique_free<void*> load(size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const;
+};
+#pragma pack(1)
+
+struct LazilyLoaded {
+  RunList* runList; // The "lazy loader"
+
+  // Using `runList`, "loads" (doesn't actually read from disk though) MyDataRuns up to and including totalOffsetFromStartInClusters (tip to specify in bytes: try passing in totalOffsetFromStartInClusters = x / `NTFS.bytesPerCluster()` where x is the number of bytes to load up to (and is a multiple of bytesPerCluster() -- round up to it if needed)). If there is more available but it isn't loaded, the returned MyDataRuns object will have hasMore set to true. You can call this function again with a larger totalOffsetFromStartInClusters to fix this.
+  MyDataRuns loadUpTo(size_t totalOffsetFromStartInClusters) const;
+};
+//using NonResidentAttributeContent = LazilyLoaded;
 
 // Resident = in this MFT. These have a different structure from non-resident ones.
 struct ResidentAttribute {
@@ -291,19 +352,7 @@ struct ResidentAttribute {
   uint8_t indexedFlag; // ntfsdoc-0.6/concepts/attribute_header.html
   char padding[1]; // ntfsdoc-0.6/concepts/attribute_header.html
 
-  // Returns the attribute name or nullptr if this is not a named attribute.
-  ArrayWithLength<uint16_t> name() {
-    if (base.lengthOfName != 0) {
-      assert(base.offsetToName != 0);
-      return {(uint16_t*)((uint8_t*)this + base.offsetToName), base.lengthOfName};
-    }
-    else {
-      //assert(base.offsetToName == 0);
-      return {nullptr, 0};
-    }
-  }
-
-  AttributeContent content() {
+  AttributeContent content() const {
     uint8_t* contentPtr = (uint8_t*)this + offsetToContent;
     switch (base.typeIdentifier) {
     case STANDARD_INFORMATION:
@@ -316,21 +365,143 @@ struct ResidentAttribute {
   }
 };
 
+// Hack for mpz_t to prevent weird errors assigning to mpz_t
+#pragma pack(1)
+struct MPZCastThing { char caster[sizeof(mpz_t)]; };
+#pragma pack()
+
+// https://stackoverflow.com/questions/5055636/casting-an-object-to-char-for-saving-loading
+template<class To, class From>
+To any_cast(From v)
+{
+    return static_cast<To>(static_cast<void*>(v));
+}
+
+// Wrapper for a GMP multi-precision integer ("z").
+struct MPZWrapper {
+  mpz_t z;
+  MPZWrapper() { mpz_init(z); }
+  MPZWrapper(mpz_t z_) { *(MPZCastThing*)&z = any_cast<MPZCastThing>(z_); }
+  MPZWrapper(const MPZWrapper&& o) { *(MPZCastThing*)&z = any_cast<MPZCastThing>(o.z); }
+  MPZWrapper(const MPZWrapper& o) {
+    mpz_init(z);
+    mpz_set(z, o.z); // Copy it over from `o`
+  }
+  ~MPZWrapper() { mpz_clear(z); /* Free it */ }
+
+  MPZWrapper& operator=(const MPZWrapper& o) {
+    mpz_set(z, o.z); // Copy it over from `o`
+    return *this;
+  }
+
+  MPZWrapper(const uint8_t* source, size_t length) {
+    //mpz_init(z);
+    // https://gmplib.org/manual/Useful-Macros-and-Constants
+    //static_assert(mp_bits_per_limb == sizeof(mp_limb_t) * CHAR_BIT); // Untested
+    // https://gmplib.org/manual/Initializing-Integers
+    //mpz_init2(z, (length + sizeof(mp_limb_t)) * CHAR_BIT); // CHAR_BIT is bits in a byte
+    // https://gmplib.org/manual/Integer-Import-and-Export#Integer-Import-and-Export , https://stackoverflow.com/questions/6683773/how-to-initialize-a-mpz-t-in-gmp-with-a-1024-bit-number-from-a-character-string
+    mpz_import(z, length /*count (in words)*/, 1 /*order*/, sizeof(uint8_t) /*each word's size in bytes*/, 0 /*endian*/, 0 /*nails*/, source);
+  }
+
+  size_t toSizeT() const {
+    //if (mpz_fits_ulong_p(z.z)) { // Then this fits in an unsigned long int.
+    //static_assert(sizeof(unsigned long int) >= sizeof(size_t));
+
+    size_t bytesNeededForZ = mpz_sizeinbase(z, 2);
+    assert(bytesNeededForZ <= sizeof(size_t));
+    //size_t builtInSizeT;
+    //mpz_import(z, 1, 1, sizeof(size_t), 0, 0, &builtInSizeT);
+
+    constexpr size_t wordSize = sizeof(size_t);
+    size_t wordCount;
+    constexpr size_t requiredWordCount = 1;
+    unique_free_mp<void*, requiredWordCount, wordSize> outRaw((void**)mpz_export(nullptr, &wordCount, 1, wordSize, 0, 0, z));
+    assert(wordCount == requiredWordCount); // Make sure that our integer type can still hold the value
+    const size_t out = *(size_t*)(outRaw.get());
+    return out;
+  }
+};
+
+// This struct describes ntfsdoc-0.6/concepts/data_runs.html
+struct RunList {
+  uint8_t header; // This header tells you (via the two nibbles of this header byte) how large the `offset()` and `length()` values are, respectively. After these offset() and length() values is 0x00, a null byte to terminate the RunList.
+
+  size_t sizeOfLength() const {
+    return header & 0x0f; // `header` = 0xXY (in hex) where Y is the size of `length()` and X is the size of `offset()`
+  }
+
+  size_t sizeOfOffset() const {
+    return header >> 4;
+  }
+
+  // Returns the length of the clusters pointed to by this RunList, in clusters.
+  MPZWrapper length() const {
+    uint8_t* value = (uint8_t*)this + sizeof(RunList().header);
+    size_t length = sizeOfLength();
+    MPZWrapper z(value, length);
+    return std::move(z);
+  }
+
+  // Returns the offset of the clusters pointed to by this RunList, in LCNs (logical cluster numbers). This offset is from the start of the NTFS volume *if* this is the first entry in the RunList; otherwise, this is the offset from the `offset()` of the previous entry in the RunList.
+  MPZWrapper offset() const {
+    uint8_t* value = (uint8_t*)this + sizeof(RunList().header) + sizeOfLength();
+    size_t length = sizeOfOffset();
+    MPZWrapper z(value, length);
+    return std::move(z);
+  }
+
+  // Returns the next entry of this RunList, or nullptr if this is the last one.
+  RunList* next() const {
+    uint8_t* value = (uint8_t*)this + sizeof(RunList().header) + sizeOfLength() + sizeOfOffset();
+    if (*value == 0x00) {
+      return nullptr;
+    }
+    return (RunList*)value;
+  }
+};
+
+MyDataRuns LazilyLoaded::loadUpTo(size_t totalOffsetFromStartInClusters) const {
+  // Accumulate offsets
+  MyDataRuns dataRuns;
+  size_t counter = 0, offsetCounter = 0;
+  for (RunList* rl = runList; rl != nullptr; rl = rl->next()) {
+    MPZWrapper z = runList->offset();
+    size_t offset = z.toSizeT();
+    z = runList->length();
+    size_t length = z.toSizeT();
+
+    counter += length;
+    offsetCounter += offset;
+    dataRuns.dataRuns.push_back({
+	.offset = offset,
+	.length = counter >= totalOffsetFromStartInClusters ? counter - totalOffsetFromStartInClusters : length
+      });
+    dataRuns.hasMore = counter > totalOffsetFromStartInClusters; // || rl->next() != nullptr;
+    if (counter >= totalOffsetFromStartInClusters) {
+      // Done loading
+      printf("LazilyLoaded::loadUpTo: done loading: counter %ju, totalOffsetFromStartInClusters %ju, rl->next() %p\n", counter, totalOffsetFromStartInClusters, rl->next()); // if (rl->next() != nullptr || counter > totalOffsetFromStartInClusters) then more is left to load!
+      break;
+    }
+  }
+
+  return dataRuns;
+}
+
 // "non-resident attributes need to describe an arbitrary number of cluster runs, consecutive clusters that they occupy."
 struct NonResidentAttribute {
   AttributeBase base;
-  uint64_t startingVirtualClusterNumber;
-  uint64_t endingVirtualClusterNumber;
-  uint16_t offsetToTheRunList;
-  uint16_t compressionUnitSize;
+  uint64_t startingVirtualClusterNumberOfTheDataRuns;
+  uint64_t endingVirtualClusterNumberOfTheDataRuns;
+  uint16_t offsetToTheRunList; // aka the "[list of stuff that points to the] data runs"
+  uint16_t compressionUnitSize; // "[Actual?] compression unit size = 2^x clusters [where x is probably compressionUnitSize]. 0 implies uncompressed" ( ntfsdoc-0.6/concepts/attribute_header.html )
   uint32_t unused;
-  uint64_t allocatedSizeOfTheAttributeContent;
+  uint64_t allocatedSizeOfTheAttributeContent; // "This is the attribute size rounded up to the cluster size" ( ntfsdoc-0.6/concepts/attribute_header.html )
   uint64_t actualSizeOfTheAttributeContent;
-  uint64_t initializedSizeOfTheAttributeContent;
-  
-  AttributeContent content() {
-    throw UnhandledValue(); // Not yet implemented actually
-  }
+  uint64_t initializedSizeOfTheAttributeContent; // "Compressed data size." ( ntfsdoc-0.6/concepts/attribute_header.html )
+
+  template <typename T>
+  AttributeContentWithFreer<T> content(size_t limitToLoad, int fd, NTFS* ntfs) const;
 };
 
 using Attribute = std::variant<ResidentAttribute*, NonResidentAttribute*>;
@@ -350,15 +521,21 @@ struct MFTRecord {
   char magicNumber[4]; // "FILE" (or, if the entry is unusable, we would find it marked as "BAAD").
   uint16_t updateSequenceOffset;
   uint16_t numEntriesInFixupArray; // Fixup array = update sequence (synonymns).  // This is the number of entries where an entry is a single 16 bit value.
-  uint64_t logFileSequenceNumber; // (LSN)  // "Each MFT record is addressed by a 48 bit MFT entry value [is simply the 0-based index of this record; an "entry index"].The first entry has address 0. Each MFT entry has a 16 bit sequence number that is incremented when the entry is allocated. MFT entry value and sequence number combined yield 64b [bit] file reference address."
-  uint16_t sequenceNumber; // Says how many times this entry has been used.
+  uint64_t logFileSequenceNumber; // (LSN)  // "Each MFT record is addressed by a 48 bit MFT entry value [is simply the 0-based index of this record; an "entry index"].The first entry has address 0. Each MFT entry has a 16 bit sequence number that is incremented when the entry is allocated. MFT entry value and sequence number combined yield 64b [bit] file reference address."  // "This is changed every time the record is modified." ( ntfsdoc-0.6/concepts/file_record.html )
+  uint16_t sequenceNumber; // Says how many times this entry has been used.  // "N.B. The increment (skipping zero) is done when the file is deleted." + "N.B. If this is set to zero it is left as zero." ( ntfsdoc-0.6/concepts/file_record.html )
   uint16_t hardLinkCount; // "The hard link count is the number of directory entries that reference this record."
   uint16_t offsetToFirstAttribute; // *useful*
   MFTEntryFlags flags;
   uint32_t usedSizeOfMFTEntry;
   uint32_t allocatedSizeOfMFTEntry;
   uint64_t fileReferenceToTheBase_FILE_record; // "MFT entries could be larger than fit into the normal space. In this case, the MFT entry will start in the base MFT record and continued in an extension record." If the file reference to the base file entry is 0x 00 00 00 00 00 00 00 00 then this is a base record. Were it not so, then this field would contain a reference to the base MFT record.
-  uint16_t nextAttributeID; // This is the "next attribute ID" in the sense that it is the next attribute ID to place into this MFTRecord *if* you are adding a new attribute entry I think. Since the attributes are in ascending order by ID apparently. Anyway, main point is that numAttributes() is based on this.
+  uint16_t nextAttributeID; // This is the "next attribute ID" in the sense that it is the next attribute ID to place into this MFTRecord *if* you are adding a new attribute entry I think. Since the attributes are in ascending order by ID apparently. Anyway, main point is that numAttributes() is based on this.       // ntfsdoc-0.6/concepts/attribute_id.html : {"
+  // Next Attribute Id
+  //     The Attribute Id that will be assigned to the next Attribute added to this MFT Record.
+  //     N.B. Incremented each time it is used.
+  //     N.B. Every time the MFT Record is reused this Id is set to zero.
+  //     N.B. The first instance number is always 0.
+  // "}
   char padding10[2]; // "Align to 4B boundary" on Windows XP
   // [I think this is this but not sure:] The "entry value" or "entry number" for this MFTRecord. This is just the 0-based index of this record basically.
   uint32_t numberOfThisMFTRecord; // On Windows XP
@@ -478,12 +655,13 @@ struct MFTRecord {
 };
 
 struct NTFS {
+  // For more info see ntfsdoc-0.6/files/boot.html since this is $Boot. Also see https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html where it says "Table 2: BPB and extended BPB fields on NTFS volumes".
   char padding0[0x0B];
   uint16_t bytesPerSector;
   char padding10[0x0D-0x0B-sizeof(uint16_t)];
   uint8_t sectorsPerCluster;
   char padding20[0x30-0x0D-sizeof(uint8_t)];
-  uint64_t mftOffset; // In clusters
+  uint64_t mftOffset; // In clusters (LCNs)
 
   uint64_t bytesPerCluster() const {
     return bytesPerSector * sectorsPerCluster;
@@ -497,6 +675,106 @@ struct NTFS {
     return buf;
   }
 };
+
+// Makes and loads a contiguous buffer from the dataRuns' specified offsets and lengths by dynamically allocating enough memory to hold it, then returning it. The buffer may be incomplete, i.e. if the amount available in `dataRuns` was less than `amountToLoad`. If so, `out_moreNeeded` will be set to true by this function.
+// `bool out_moreNeeded` will be set to true if the `dataRuns` ran out before `amountToLoad` was reached; otherwise, it will be set to false.
+// `out_more` will be set to a positive number indicating how much more was left to be loaded *if* `amountToLoad` was less than the total length of `dataRuns`. It will be set to a negative number if `amountToLoad` is greater than the total length of `dataRuns`. It will be set to zero otherwise.
+// Returns a unique_ptr containing nullptr if `dataRuns.size() == 0`.
+unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const {
+  size_t totalLength = 0;
+  bool completeStruct = false;
+  void* buf = nullptr;
+  // Assumptions (for now) //
+  *out_more = 0;
+  *out_moreNeeded = false;
+  // //
+  
+  // NOTE: this is not checked because it is outside the scope/concerns of this function. This needs to be checked when using LazilyLoaded::loadUpTo().
+  // if (dataRuns.hasMore) {
+  //   *out_moreNeeded = true;
+  // }
+  
+  for (const MyDataRun& dr : dataRuns) {
+    printf("MyDataRuns::load: processing: dr.offset = %ju, length = %ju\n", dr.offset, dr.length);
+    if (dr.length == 0) {
+      // completeStruct = true;
+      // break;
+
+      printf("MyDataRuns::load: dr.length == 0\n");
+      continue;
+    }
+    
+    size_t lengthToLoad = dr.length * ntfs->bytesPerCluster();
+    if (totalLength + lengthToLoad >= amountToLoad) {
+      // Limit length of what we load
+      lengthToLoad = totalLength - lengthToLoad;
+      completeStruct = true;
+      *out_more = lengthToLoad;
+    }
+    printf("MyDataRuns::load: calling realloc(%p, %zu) aka %f MiB\n", buf, totalLength, (float)totalLength / 1024 / 1024);
+    buf = realloc(buf, lengthToLoad);
+    _lseek(fd, dr.offset, SEEK_CUR); // Seek relative to the last seek
+    _read(fd, buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/, lengthToLoad);
+    _lseek(fd, -lengthToLoad, SEEK_CUR); // Seek back to the start of the run (since the fd's file offset was changed after the read())
+    totalLength += lengthToLoad;
+    if (totalLength >= amountToLoad || completeStruct) {
+      // Done loading
+      completeStruct = true;
+      if (totalLength > amountToLoad) {
+	*out_more = amountToLoad - totalLength; // (Negative)
+      }
+      break;
+    }
+  }
+
+  if (!completeStruct) { // Then `amountToLoad` was too large for the runs' contents, or the runs ran out because not enough was loaded.
+    *out_moreNeeded = true;
+  }
+
+  return unique_free<void*>((void**)buf);
+}
+
+template <typename T>
+AttributeContentWithFreer<T> NonResidentAttribute::content(size_t limitToLoad, int fd, NTFS* ntfs) const {
+  //throw UnhandledValue(); // Not yet implemented actually
+
+  // Load all the content virtually (since we can't load it all because it might be massive amounts of data)
+  // Grab the runlist
+  RunList* firstRunListEntry = (RunList*)((uint8_t*)this + offsetToTheRunList);
+  // Grab its data runs
+  size_t attrActualSize = 0; // 0 if unknown
+  switch (base.typeIdentifier) {
+  case STANDARD_INFORMATION:
+    attrActualSize = sizeof(StandardInformation);
+    break;
+  case FILE_NAME:
+    attrActualSize = sizeof(FileName);
+    break;
+  case DATA:
+    break;
+  default:
+    throw UnhandledValue();
+  }
+
+  if (attrActualSize > limitToLoad) {
+    printf("NonResidentAttribute::content: attrActualSize > limitToLoad. attrActualSize = %ju, limitToLoad = %ju\n", attrActualSize, limitToLoad);
+  }
+  limitToLoad = std::min(limitToLoad, attrActualSize);
+  MyDataRuns dr = LazilyLoaded{firstRunListEntry}.loadUpTo(limitToLoad);
+  bool moreNeeded; ssize_t more;
+  auto ptr = dr.load(limitToLoad, fd, ntfs, &moreNeeded, &more);
+  printf("NonResidentAttribute::content: dr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", more);
+  switch (base.typeIdentifier) {
+  case STANDARD_INFORMATION:
+    return (unique_free<StandardInformation>)ptr;
+  case FILE_NAME:
+    return (unique_free<FileName>)ptr;
+  case DATA:
+    return (unique_free<Data>)ptr;
+  default:
+    throw UnhandledValue();
+  }
+}
 
 // Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
 template <typename AttributeContentT>
