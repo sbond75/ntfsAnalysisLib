@@ -4,6 +4,7 @@ SOURCES_CPP := main.cpp
 SOURCES_C := tools.c
 OBJS := $(SOURCES_CPP:.cpp=.o) $(SOURCES_C:.c=.o)
 CPPFLAGS:=$(CPPFLAGS) -std=c++17 -O0 -g3 -ggdb3
+LIBS=-lgmp
 
 .PHONY: all
 all: a.out

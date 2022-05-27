@@ -52,7 +52,7 @@ off_t _lseek(int fd, off_t offset, int whence) {
     throw errno;
   }
   else if (ret != offset) {
-    perror("lseek didn't go to the expected offset");
+    fprintf(stderr, "lseek didn't go to the expected offset: expected %jd but got %jd\n", (intmax_t)offset, (intmax_t)ret);
     throw errno;
   }
   return ret;
@@ -312,7 +312,7 @@ struct Data {
 };
 using AttributeContent = std::variant<StandardInformation*, FileName*, Data*>; // Note: there are more than just these
 // Contains `ptr` which will be freed and the superclass which holds type info for the `ptr`.
-class AttributeContentWithFreer: AttributeContent {
+class AttributeContentWithFreer: public AttributeContent {
   unique_free<void*> ptr;
 public:
   template <typename T>
@@ -322,6 +322,10 @@ public:
   AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent((T*)other.ptr.get()) {}
 
   AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
+  
+  AttributeContentWithFreer(const AttributeContent&& other): ptr(), AttributeContent(other) {}
+  
+  AttributeContentWithFreer(const AttributeContent& other): ptr(), AttributeContent(other) {}
 };
 struct RunList; struct NTFS;
 
@@ -375,22 +379,27 @@ struct ResidentAttribute {
 // Wrapper for a GMP multi-precision integer ("z").
 struct MPZWrapper {
   mpz_t z;
-  MPZWrapper() { mpz_init(z); }
-  MPZWrapper(mpz_t z_) { memcpy(&z, &z_, sizeof(mpz_t)); }
-  MPZWrapper(const MPZWrapper&& o) { memcpy(&z, &o.z, sizeof(mpz_t)); }
+  bool initted;
+  MPZWrapper() { mpz_init(z); initted = true; }
+  MPZWrapper(mpz_t z_) { memcpy(&z, &z_, sizeof(mpz_t)); initted = true; }
+  MPZWrapper(MPZWrapper&& o) { memcpy(&z, &o.z, sizeof(mpz_t)); initted = true; o.initted = false; }
   MPZWrapper(const MPZWrapper& o) {
     mpz_init(z);
     mpz_set(z, o.z); // Copy it over from `o`
+    initted = true;
   }
-  ~MPZWrapper() { mpz_clear(z); /* Free it */ }
+  ~MPZWrapper() { if (!initted) mpz_clear(z); /* Free it */ }
 
   MPZWrapper& operator=(const MPZWrapper& o) {
     mpz_set(z, o.z); // Copy it over from `o`
+    initted = true;
     return *this;
   }
 
   MPZWrapper(const uint8_t* source, size_t length) {
-    //mpz_init(z);
+    mpz_init(z);
+    initted = true;
+    
     // https://gmplib.org/manual/Useful-Macros-and-Constants
     //static_assert(mp_bits_per_limb == sizeof(mp_limb_t) * CHAR_BIT); // Untested
     // https://gmplib.org/manual/Initializing-Integers
@@ -403,7 +412,8 @@ struct MPZWrapper {
     //if (mpz_fits_ulong_p(z.z)) { // Then this fits in an unsigned long int.
     //static_assert(sizeof(unsigned long int) >= sizeof(size_t));
 
-    size_t bytesNeededForZ = mpz_sizeinbase(z, 2);
+    size_t bytesNeededForZ = integerDivisionRoundingUp(mpz_sizeinbase(z, 2), (size_t)CHAR_BIT); // Convert bits to bytes, rounding up so we know it can be stored
+    printf("MPZWrapper::toSizeT: bytesNeededForZ: %ju, sizeof(size_t): %ju\n", (uintmax_t)bytesNeededForZ, (uintmax_t)sizeof(size_t));
     assert(bytesNeededForZ <= sizeof(size_t));
     //size_t builtInSizeT;
     //mpz_import(z, 1, 1, sizeof(size_t), 0, 0, &builtInSizeT);
@@ -475,7 +485,7 @@ MyDataRuns LazilyLoaded::loadUpTo(size_t totalOffsetFromStartInClusters) const {
     dataRuns.hasMore = counter > totalOffsetFromStartInClusters; // || rl->next() != nullptr;
     if (counter >= totalOffsetFromStartInClusters) {
       // Done loading
-      printf("LazilyLoaded::loadUpTo: done loading: counter %ju, totalOffsetFromStartInClusters %ju, rl->next() %p\n", counter, totalOffsetFromStartInClusters, rl->next()); // if (rl->next() != nullptr || counter > totalOffsetFromStartInClusters) then more is left to load!
+      printf("LazilyLoaded::loadUpTo: done loading: counter %ju, totalOffsetFromStartInClusters %ju, rl->next() %p\n", (uintmax_t)counter, (uintmax_t)totalOffsetFromStartInClusters, rl->next()); // if (rl->next() != nullptr || counter > totalOffsetFromStartInClusters) then more is left to load!
       break;
     }
   }
@@ -547,7 +557,7 @@ struct MFTRecord {
   void hexDump() const {
     auto size = totalSize();
     DumpHex(this, size);
-    printf("  \tSize: %ju\n", size);
+    printf("  \tSize: %ju\n", (uintmax_t)size);
   }
 
   // Returns the sum of all attributes' sizes.
@@ -579,7 +589,7 @@ struct MFTRecord {
       counter++;
     };
 
-    printf("numAttributes: counter %ju, retval %ju\n", counter, retval);
+    printf("numAttributes: counter %ju, retval %ju\n", (uintmax_t)counter, (uintmax_t)retval);
     //assert(counter == retval);
     //return retval;
 
@@ -621,10 +631,10 @@ struct MFTRecord {
       }
       
       uint16_t* valPtr = (uint16_t*)sectorIterator;
-      printf("applyFixup: %ju should be usn %ju", *valPtr, usn);
+      printf("applyFixup: %ju should be usn %ju", (uintmax_t)*valPtr, (uintmax_t)usn);
       fflush(stdout);
       assert(*valPtr == usn);
-      printf("; %ju -> %ju\n", *valPtr, val);
+      printf("; %ju -> %ju\n", (uintmax_t)*valPtr, (uintmax_t)val);
       *valPtr = val;
       sectorIterator += bytesPerSector;
     }
@@ -689,7 +699,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
   // }
   
   for (const MyDataRun& dr : dataRuns) {
-    printf("MyDataRuns::load: processing: dr.offset = %ju, length = %ju\n", dr.offset, dr.length);
+    printf("MyDataRuns::load: processing: dr.offset = %ju, length = %ju\n", (uintmax_t)dr.offset, (uintmax_t)dr.length);
     if (dr.length == 0) {
       // completeStruct = true;
       // break;
@@ -750,13 +760,13 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, int 
   }
 
   if (attrActualSize > limitToLoad) {
-    printf("NonResidentAttribute::content: attrActualSize > limitToLoad. attrActualSize = %ju, limitToLoad = %ju\n", attrActualSize, limitToLoad);
+    printf("NonResidentAttribute::content: attrActualSize > limitToLoad. attrActualSize = %ju, limitToLoad = %ju\n", (uintmax_t)attrActualSize, (uintmax_t)limitToLoad);
   }
   limitToLoad = std::min(limitToLoad, attrActualSize);
   MyDataRuns dr = LazilyLoaded{firstRunListEntry}.loadUpTo(limitToLoad);
   bool moreNeeded; ssize_t more;
   auto ptr = dr.load(limitToLoad, fd, ntfs, &moreNeeded, &more);
-  printf("NonResidentAttribute::content: dr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", more);
+  printf("NonResidentAttribute::content: dr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", (intmax_t)more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
     return AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release()));
@@ -783,8 +793,8 @@ AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, Attri
   if (attrOfDesiredType == std::end(attributes)) {
     return nullptr;
   }
-  std::unique_ptr<AttributeContent /*<-- the base class*/> content = std::visit([&](auto v){return std::make_unique<typename std::decay<decltype(std::declval<decltype(v)>()->content((size_t)0, (int)0, (NTFS*)0))>::type>(new (typename std::decay<decltype(std::declval<decltype(v)>()->content((size_t)0, (int)0, (NTFS*)0))>::type)(v->content(limitToLoad, fd, ntfs)));}, *attrOfDesiredType); // Get content()
-  AttributeContentT* desiredType = std::get<AttributeContentT*>(*content); // Unwrap std::variant
+  AttributeContentWithFreer content = std::visit([&](auto v){return AttributeContentWithFreer(v->content(limitToLoad, fd, ntfs));}, *attrOfDesiredType); // Get content()
+  AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
   return desiredType;
 }
 
@@ -796,11 +806,11 @@ int main(int argc, char** argv) {
 
   struct NTFS buf;
   ssize_t ret = _read(fd, &buf, sizeof(NTFS));
-  printf("mftOffset: %ju %ju\n", buf.mftOffset, buf.mftOffset * buf.bytesPerCluster());
+  printf("mftOffset: %ju %ju\n", (uintmax_t)buf.mftOffset, (uintmax_t)(buf.mftOffset * buf.bytesPerCluster()));
 
   MFTRecord rec = buf.getFirstMFTRecord(fd);
   rec.applyFixup(buf.bytesPerSector);
-  printf("numberOfThisMFTRecord: %ju , sequenceNumber: %ju ; fileReferenceAddress of first MFT record: computed %ju stored %ju\n",rec.numberOfThisMFTRecord, rec.sequenceNumber, rec.computedFileReferenceAddress(), rec.fileReferenceToTheBase_FILE_record);
+  printf("numberOfThisMFTRecord: %ju , sequenceNumber: %ju ; fileReferenceAddress of first MFT record: computed %ju stored %ju\n",(uintmax_t)rec.numberOfThisMFTRecord, (uintmax_t)rec.sequenceNumber, (uintmax_t)rec.computedFileReferenceAddress(), (uintmax_t)rec.fileReferenceToTheBase_FILE_record);
 
   auto attributes = rec.attributes();
   for (auto& v : attributes) {
