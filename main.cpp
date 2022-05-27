@@ -476,8 +476,9 @@ struct MPZWrapper {
     constexpr size_t wordSize = sizeof(size_t);
     size_t wordCount;
     constexpr size_t requiredWordCount = 1;
-    unique_free_mp<void*, requiredWordCount, wordSize> outRaw((void**)mpz_export(nullptr, &wordCount, 1, wordSize, 0, 0, z));
+    unique_free_mp<void*, requiredWordCount, wordSize> outRaw((void**)mpz_export(nullptr, &wordCount, 1, wordSize, 0, 0, z)); // "The sign of `op` [`z`] is ignored, just the absolute value is exported. An application can use mpz_sgn to get the sign and handle it as desired. (see Section 5.10 [Integer Comparisons] [ https://gmplib.org/manual/Integer-Comparisons.html ], page 39)" ( https://gmplib.org/manual/Integer-Import-and-Export + pdf manual )
     assert(wordCount == requiredWordCount); // Make sure that our integer type can still hold the value
+    printf("MPZWrapper::toSizeT: result: "); DumpHex(outRaw.get(), wordSize);
     const size_t out = *(size_t*)(outRaw.get());
     return out;
   }
@@ -499,6 +500,7 @@ struct RunList {
   MPZWrapper length() const {
     uint8_t* value = (uint8_t*)this + sizeof(RunList().header);
     size_t length = sizeOfLength();
+    printf("RunList::length():"); DumpHex(value, length);
     MPZWrapper z(value, length);
     return std::move(z);
   }
@@ -507,6 +509,7 @@ struct RunList {
   MPZWrapper offset() const {
     uint8_t* value = (uint8_t*)this + sizeof(RunList().header) + sizeOfLength();
     size_t length = sizeOfOffset();
+    printf("RunList::offset():"); DumpHex(value, length);
     MPZWrapper z(value, length);
     return std::move(z);
   }
