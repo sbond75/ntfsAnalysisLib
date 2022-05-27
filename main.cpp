@@ -495,7 +495,13 @@ struct MPZWrapper {
 				 free_mp{wordCount, wordSize});
     printf("MPZWrapper::toSizeT: wordCount = %ju, maxWordCount = %ju\n", (uintmax_t)wordCount, (uintmax_t)maxWordCount);
     assert(wordCount <= maxWordCount); // Make sure that our integer type can still hold the value
-    printf("MPZWrapper::toSizeT: result: "); DumpHex(outRaw.get(), wordCount);
+    printf("MPZWrapper::toSizeT: result before realloc: "); DumpHex(outRaw.get(), wordCount);
+
+    void* (*reallocFunction)(void*, size_t, size_t);
+    mp_get_memory_functions(nullptr, &reallocFunction, nullptr);
+    buf = reallocFunction(buf, wordCount * wordSize, maxWordCount * wordSize); // buf, old size, new size
+    printf("MPZWrapper::toSizeT: result after realloc: "); DumpHex(outRaw.get(), maxWordCount);
+    
     const size_t out = *(size_t*)(outRaw.get());
     return out;
   }
