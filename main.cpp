@@ -472,7 +472,8 @@ struct MPZWrapper {
     // https://gmplib.org/manual/Initializing-Integers
     //mpz_init2(z, (length + sizeof(mp_limb_t)) * CHAR_BIT); // CHAR_BIT is bits in a byte
     // https://gmplib.org/manual/Integer-Import-and-Export#Integer-Import-and-Export , https://stackoverflow.com/questions/6683773/how-to-initialize-a-mpz-t-in-gmp-with-a-1024-bit-number-from-a-character-string
-    mpz_import(z, length /*count (in words)*/, 1 /*order*/, sizeof(uint8_t) /*each word's size in bytes*/, 0 /*endian*/, 0 /*nails*/, source);
+    mpz_import(z, length /*count (in words)*/, 1 /*order*/, sizeof(uint8_t) /*each word's size in bytes*/, 0 /*endian*/, 0 /*nails*/, source); // "There is no sign taken from the data, rop will simply be a positive integer. An application can handle any sign itself, and apply it for instance with mpz_neg." ( https://gmplib.org/manual/Integer-Import-and-Export )
+    gmp_printf ("MPZWrapper::MPZWrapper: imported mpz_t: %Zu\n", z);
   }
 
   size_t toSizeT() const {
@@ -500,6 +501,8 @@ struct MPZWrapper {
     void* (*reallocFunction)(void*, size_t, size_t);
     mp_get_memory_functions(nullptr, &reallocFunction, nullptr);
     buf = reallocFunction(buf, wordCount * wordSize, maxWordCount * wordSize); // buf, old size, new size
+    // Zero out the rest
+    memset(buf + (wordCount * wordSize), 0, (maxWordCount * wordSize - wordCount * wordSize)); 
     printf("MPZWrapper::toSizeT: result after realloc: "); DumpHex(outRaw.get(), maxWordCount);
     
     const size_t out = *(size_t*)(outRaw.get());
@@ -794,24 +797,24 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
     }
     
     size_t lengthToLoad = dr.length * ntfs->bytesPerCluster();
-    printf("MyDataRuns::load: lengthToLoad: %zu\n", lengthToLoad);
-    if (totalLength + lengthToLoad > amountToLoad) {
+    printf("MyDataRuns::load: lengthToLoad: %zu bytes\n", lengthToLoad);
+    if (totalLength + lengthToLoad > amountToLoad) { // TODO: untested
       // Limit length of what we load
       lengthToLoad = totalLength - lengthToLoad;
-      printf("MyDataRuns::load: limiting length to %zu\n", lengthToLoad);
+      printf("MyDataRuns::load: limiting length to %zu bytes\n", lengthToLoad);
       completeStruct = true;
       *out_more = lengthToLoad;
     }
     printf("MyDataRuns::load: calling realloc(%p, %zu) aka %f MiB\n", buf, totalLength+lengthToLoad, (float)(totalLength+lengthToLoad) / 1024 / 1024);
     buf = realloc(buf, totalLength+lengthToLoad);
-    _lseek(fd, dr.offset, SEEK_CUR); // Seek relative to the last seek
+    _lseek(fd, dr.offset * ntfs->bytesPerCluster(), SEEK_CUR); // Seek relative to the last seek
     _read(fd, (uint8_t*)buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/, lengthToLoad);
     _lseek(fd, -lengthToLoad, SEEK_CUR); // Seek back to the start of the run (since the fd's file offset was changed after the read())
     totalLength += lengthToLoad;
     if (totalLength >= amountToLoad || completeStruct) {
       // Done loading
       completeStruct = true;
-      if (totalLength > amountToLoad) {
+      if (totalLength > amountToLoad) { // TODO: untested
 	*out_more = amountToLoad - totalLength; // (Negative)
       }
       break;
@@ -819,7 +822,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
   }
 
   if (!completeStruct) { // Then `amountToLoad` was too large for the runs' contents, or the runs ran out because not enough was loaded.
-    *out_moreNeeded = true;
+    *out_moreNeeded = true; // TODO: untested
   }
 
   return unique_free<void*>((void**)buf);
