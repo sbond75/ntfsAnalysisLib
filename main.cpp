@@ -472,7 +472,8 @@ struct MPZWrapper {
     // https://gmplib.org/manual/Initializing-Integers
     //mpz_init2(z, (length + sizeof(mp_limb_t)) * CHAR_BIT); // CHAR_BIT is bits in a byte
     // https://gmplib.org/manual/Integer-Import-and-Export#Integer-Import-and-Export , https://stackoverflow.com/questions/6683773/how-to-initialize-a-mpz-t-in-gmp-with-a-1024-bit-number-from-a-character-string
-    mpz_import(z, length /*count (in words)*/, 1 /*order*/, sizeof(uint8_t) /*each word's size in bytes*/, 0 /*endian*/, 0 /*nails*/, source); // "There is no sign taken from the data, rop will simply be a positive integer. An application can handle any sign itself, and apply it for instance with mpz_neg." ( https://gmplib.org/manual/Integer-Import-and-Export )
+    printf("MPZWrapper::MPZWrapper: importing: "); DumpHex(source, length);
+    mpz_import(z, length /*count (in words)*/, -1 /*order*/, sizeof(uint8_t) /*each word's size in bytes*/, 0 /*endian*/, 0 /*nails*/, source); // "There is no sign taken from the data, rop will simply be a positive integer. An application can handle any sign itself, and apply it for instance with mpz_neg." ( https://gmplib.org/manual/Integer-Import-and-Export )
     gmp_printf ("MPZWrapper::MPZWrapper: imported mpz_t: %Zu\n", z);
   }
 
@@ -491,7 +492,7 @@ struct MPZWrapper {
     constexpr size_t wordSize = 1;
     size_t wordCount;
     constexpr size_t maxWordCount = sizeof(size_t);
-    void* buf = (void*)mpz_export(nullptr, &wordCount, 1, wordSize, 0, 0, z); // "The sign of `op` [`z`] is ignored, just the absolute value is exported. An application can use mpz_sgn to get the sign and handle it as desired. (see Section 5.10 [Integer Comparisons] [ https://gmplib.org/manual/Integer-Comparisons.html ], page 39)" ( https://gmplib.org/manual/Integer-Import-and-Export + pdf manual )
+    void* buf = (void*)mpz_export(nullptr, &wordCount, -1, wordSize, 0, 0, z); // "The sign of `op` [`z`] is ignored, just the absolute value is exported. An application can use mpz_sgn to get the sign and handle it as desired. (see Section 5.10 [Integer Comparisons] [ https://gmplib.org/manual/Integer-Comparisons.html ], page 39)" ( https://gmplib.org/manual/Integer-Import-and-Export + pdf manual )
     unique_free_mp<void*> outRaw((void**)buf,
 				 free_mp{wordCount, wordSize});
     printf("MPZWrapper::toSizeT: wordCount = %ju, maxWordCount = %ju\n", (uintmax_t)wordCount, (uintmax_t)maxWordCount);
@@ -502,7 +503,7 @@ struct MPZWrapper {
     mp_get_memory_functions(nullptr, &reallocFunction, nullptr);
     buf = reallocFunction(buf, wordCount * wordSize, maxWordCount * wordSize); // buf, old size, new size
     // Zero out the rest
-    memset(buf + (wordCount * wordSize), 0, (maxWordCount * wordSize - wordCount * wordSize)); 
+    memset((uint8_t*)buf + (wordCount * wordSize), 0, (maxWordCount * wordSize - wordCount * wordSize)); 
     printf("MPZWrapper::toSizeT: result after realloc: "); DumpHex(outRaw.get(), maxWordCount);
     
     const size_t out = *(size_t*)(outRaw.get());
@@ -526,7 +527,7 @@ struct RunList {
   MPZWrapper length() const {
     uint8_t* value = (uint8_t*)this + sizeof(RunList().header);
     size_t length = sizeOfLength();
-    printf("RunList::length():"); DumpHex(value, length);
+    printf("RunList::length(): "); DumpHex(value, length);
     MPZWrapper z(value, length);
     return std::move(z);
   }
@@ -535,7 +536,7 @@ struct RunList {
   MPZWrapper offset() const {
     uint8_t* value = (uint8_t*)this + sizeof(RunList().header) + sizeOfLength();
     size_t length = sizeOfOffset();
-    printf("RunList::offset():"); DumpHex(value, length);
+    printf("RunList::offset(): "); DumpHex(value, length);
     MPZWrapper z(value, length);
     return std::move(z);
   }
