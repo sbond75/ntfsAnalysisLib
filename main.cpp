@@ -153,9 +153,9 @@ template <typename T>
 using unique_free = std::unique_ptr<T, free_delete>;
 
 // For GMP library-allocated buffers
-template <size_t wordCount, size_t wordSize>
 struct free_mp
 {
+  size_t wordCount, wordSize;
   void operator()(void* outRaw) {
     // https://stackoverflow.com/questions/51601666/gmp-store-64-bit-interger-in-mpz-t-mpz-class-and-get-64-bit-integers-back
     // Free the allocated memory by mpz_export
@@ -164,8 +164,8 @@ struct free_mp
     freeFunction(outRaw, wordCount * wordSize);
   }
 };
-template <typename T, size_t wordCount, size_t wordSize>
-using unique_free_mp = std::unique_ptr<T, free_mp<wordCount, wordSize>>;
+template <typename T>
+using unique_free_mp = std::unique_ptr<T, free_mp>;
 
 // https://stackoverflow.com/questions/41744559/is-this-a-bug-of-gcc : {"
 // Also see LWG issue 721 [ http://www.open-std.org/jtc1/sc22/wg21/docs/lwg-closed.html#721 ] (decided as Not A Defect).
@@ -436,18 +436,30 @@ struct MPZWrapper {
   mpz_t z;
   bool initted;
   MPZWrapper() { mpz_init(z); initted = true; }
-  MPZWrapper(mpz_t z_) { memcpy(&z, &z_, sizeof(mpz_t)); initted = true; }
+  MPZWrapper(mpz_t&& z_) { memcpy(&z, &z_, sizeof(mpz_t)); initted = true; } // Takes ownership
   MPZWrapper(MPZWrapper&& o) { memcpy(&z, &o.z, sizeof(mpz_t)); initted = true; o.initted = false; }
   MPZWrapper(const MPZWrapper& o) {
-    mpz_init(z);
-    mpz_set(z, o.z); // Copy it over from `o`
-    initted = true;
+    if (o.initted) {
+      mpz_init(z);
+      initted = true;
+      mpz_set(z, o.z); // Copy it over from `o`
+    }
+    else {
+      initted = false;
+    }
   }
-  ~MPZWrapper() { if (!initted) mpz_clear(z); /* Free it */ }
+  ~MPZWrapper() { if (initted) mpz_clear(z); /* Free it */ }
 
   MPZWrapper& operator=(const MPZWrapper& o) {
-    mpz_set(z, o.z); // Copy it over from `o`
-    initted = true;
+    if (o.initted) {
+      if (!initted) mpz_init(z);
+      initted = true;
+      mpz_set(z, o.z); // Copy it over from `o`
+    }
+    else {
+      if (initted) mpz_clear(z); /* Free it */
+      initted = false;
+    }
     return *this;
   }
 
@@ -464,6 +476,8 @@ struct MPZWrapper {
   }
 
   size_t toSizeT() const {
+    assert(initted);
+    
     //if (mpz_fits_ulong_p(z.z)) { // Then this fits in an unsigned long int.
     //static_assert(sizeof(unsigned long int) >= sizeof(size_t));
 
@@ -473,12 +487,15 @@ struct MPZWrapper {
     //size_t builtInSizeT;
     //mpz_import(z, 1, 1, sizeof(size_t), 0, 0, &builtInSizeT);
 
-    constexpr size_t wordSize = sizeof(size_t);
+    constexpr size_t wordSize = 1;
     size_t wordCount;
-    constexpr size_t requiredWordCount = 1;
-    unique_free_mp<void*, requiredWordCount, wordSize> outRaw((void**)mpz_export(nullptr, &wordCount, 1, wordSize, 0, 0, z)); // "The sign of `op` [`z`] is ignored, just the absolute value is exported. An application can use mpz_sgn to get the sign and handle it as desired. (see Section 5.10 [Integer Comparisons] [ https://gmplib.org/manual/Integer-Comparisons.html ], page 39)" ( https://gmplib.org/manual/Integer-Import-and-Export + pdf manual )
-    assert(wordCount == requiredWordCount); // Make sure that our integer type can still hold the value
-    printf("MPZWrapper::toSizeT: result: "); DumpHex(outRaw.get(), wordSize);
+    constexpr size_t maxWordCount = sizeof(size_t);
+    void* buf = (void*)mpz_export(nullptr, &wordCount, 1, wordSize, 0, 0, z); // "The sign of `op` [`z`] is ignored, just the absolute value is exported. An application can use mpz_sgn to get the sign and handle it as desired. (see Section 5.10 [Integer Comparisons] [ https://gmplib.org/manual/Integer-Comparisons.html ], page 39)" ( https://gmplib.org/manual/Integer-Import-and-Export + pdf manual )
+    unique_free_mp<void*> outRaw((void**)buf,
+				 free_mp{wordCount, wordSize});
+    printf("MPZWrapper::toSizeT: wordCount = %ju, maxWordCount = %ju\n", (uintmax_t)wordCount, (uintmax_t)maxWordCount);
+    assert(wordCount <= maxWordCount); // Make sure that our integer type can still hold the value
+    printf("MPZWrapper::toSizeT: result: "); DumpHex(outRaw.get(), wordCount);
     const size_t out = *(size_t*)(outRaw.get());
     return out;
   }
