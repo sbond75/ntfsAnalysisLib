@@ -46,13 +46,22 @@ ssize_t _read(int fd, void* buf, size_t count) {
   return ret;
 }
 off_t _lseek(int fd, off_t offset, int whence) {
+  // Get current offset
+  off_t origOffsetFromStartOfFile = lseek(fd, 0, SEEK_CUR); // (Shouldn't change the offset in the file, but returns the offset from the start as lseek usually does.)
+  if (origOffsetFromStartOfFile == -1) {
+    perror("lseek to get current offset failed");
+    throw errno;
+  }
+  
   off_t ret = lseek(fd, offset, whence);
+  off_t desired;
   if (ret == -1) {
     perror("lseek failed");
     throw errno;
   }
-  else if (ret != offset) {
-    fprintf(stderr, "lseek didn't go to the expected offset: expected %jd but got %jd\n", (intmax_t)offset, (intmax_t)ret);
+  else if ((whence == SEEK_CUR && ret != (desired=origOffsetFromStartOfFile + offset)) ||
+	   (whence == SEEK_SET && ret != (desired=offset))) {
+    fprintf(stderr, "lseek didn't go to the expected offset: expected %jd but got %jd\n", (intmax_t)desired, (intmax_t)ret);
     throw errno;
   }
   return ret;
@@ -505,7 +514,7 @@ struct NonResidentAttribute {
   uint64_t actualSizeOfTheAttributeContent;
   uint64_t initializedSizeOfTheAttributeContent; // "Compressed data size." ( ntfsdoc-0.6/concepts/attribute_header.html )
 
-  AttributeContentWithFreer content(size_t limitToLoad, int fd, NTFS* ntfs) const;
+  AttributeContentWithFreer content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, NTFS* ntfs) const;
 };
 
 using Attribute = std::variant<ResidentAttribute*, NonResidentAttribute*>;
@@ -685,6 +694,8 @@ struct NTFS {
 // `out_more` will be set to a positive number indicating how much more was left to be loaded *if* `amountToLoad` was less than the total length of `dataRuns`. It will be set to a negative number if `amountToLoad` is greater than the total length of `dataRuns`. It will be set to zero otherwise.
 // Returns a unique_ptr containing nullptr if `dataRuns.size() == 0`.
 unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const {
+  _lseek(fd, 0, SEEK_SET); // Go to the start so we can use SEEK_CUR (to do a relative seek) later.
+  
   size_t totalLength = 0;
   bool completeStruct = false;
   void* buf = nullptr;
@@ -709,14 +720,16 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
     }
     
     size_t lengthToLoad = dr.length * ntfs->bytesPerCluster();
-    if (totalLength + lengthToLoad >= amountToLoad) {
+    printf("MyDataRuns::load: lengthToLoad: %zu\n", lengthToLoad);
+    if (totalLength + lengthToLoad > amountToLoad) {
       // Limit length of what we load
       lengthToLoad = totalLength - lengthToLoad;
+      printf("MyDataRuns::load: limiting length to %zu\n", lengthToLoad);
       completeStruct = true;
       *out_more = lengthToLoad;
     }
-    printf("MyDataRuns::load: calling realloc(%p, %zu) aka %f MiB\n", buf, totalLength, (float)totalLength / 1024 / 1024);
-    buf = realloc(buf, lengthToLoad);
+    printf("MyDataRuns::load: calling realloc(%p, %zu) aka %f MiB\n", buf, totalLength+lengthToLoad, (float)(totalLength+lengthToLoad) / 1024 / 1024);
+    buf = realloc(buf, totalLength+lengthToLoad);
     _lseek(fd, dr.offset, SEEK_CUR); // Seek relative to the last seek
     _read(fd, (uint8_t*)buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/, lengthToLoad);
     _lseek(fd, -lengthToLoad, SEEK_CUR); // Seek back to the start of the run (since the fd's file offset was changed after the read())
@@ -738,7 +751,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
   return unique_free<void*>((void**)buf);
 }
 
-AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, int fd, NTFS* ntfs) const {
+AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, NTFS* ntfs) const {
   //throw UnhandledValue(); // Not yet implemented actually
 
   // Load all the content virtually (since we can't load it all because it might be massive amounts of data)
@@ -759,14 +772,15 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, int 
     throw UnhandledValue();
   }
 
-  if (attrActualSize > limitToLoad) {
-    printf("NonResidentAttribute::content: attrActualSize > limitToLoad. attrActualSize = %ju, limitToLoad = %ju\n", (uintmax_t)attrActualSize, (uintmax_t)limitToLoad);
+  if (attrActualSize != 0) {
+    if (attrActualSize > limitToLoad) {
+      printf("NonResidentAttribute::content: warning: attrActualSize > limitToLoad. attrActualSize = %ju, limitToLoad = %ju. This means the whole structure won't be loaded in.\n", (uintmax_t)attrActualSize, (uintmax_t)limitToLoad);
+    }
+    limitToLoad = std::min(limitToLoad, attrActualSize);
   }
-  limitToLoad = std::min(limitToLoad, attrActualSize);
   MyDataRuns dr = LazilyLoaded{firstRunListEntry}.loadUpTo(limitToLoad);
-  bool moreNeeded; ssize_t more;
-  auto ptr = dr.load(limitToLoad, fd, ntfs, &moreNeeded, &more);
-  printf("NonResidentAttribute::content: dr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", (intmax_t)more);
+  auto ptr = dr.load(limitToLoad, fd, ntfs, out_moreNeeded, out_more);
+  printf("NonResidentAttribute::content: dr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
     return AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release()));
@@ -781,7 +795,7 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, int 
 
 // Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
 template <typename AttributeContentT>
-AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, int fd, NTFS* ntfs) {
+AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, bool* out_moreNeeded /*for non-resident*/, ssize_t* out_more /*for non-resident*/, int fd, NTFS* ntfs) {
   auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind](auto attr){
     bool ret = false;
     auto process = [&](auto attr) -> bool {
@@ -793,7 +807,7 @@ AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, Attri
   if (attrOfDesiredType == std::end(attributes)) {
     return nullptr;
   }
-  AttributeContentWithFreer content = std::visit([&](auto v){return AttributeContentWithFreer(v->content(limitToLoad, fd, ntfs));}, *attrOfDesiredType); // Get content()
+  AttributeContentWithFreer content = std::visit([&](auto v){return AttributeContentWithFreer(v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs));}, *attrOfDesiredType); // Get content()
   AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
   return desiredType;
 }
@@ -827,7 +841,8 @@ int main(int argc, char** argv) {
 
   // Now that we have the first record, we know it is the $MFT itself (entry 0). So this is a file that references itself! We need to follow its $DATA attribute to get the full MFT contents. ( https://docs.microsoft.com/en-us/windows/win32/devnotes/master-file-table : "The $Mft file contains an unnamed $DATA attribute that is the sequence of MFT record segments, in order." )
   size_t limitToLoad = 1073741824; //max amount to load from a non-resident attribute
-  auto file_name = findAttribute<FileName>(attributes, FILE_NAME, limitToLoad, fd, &buf);
+  bool moreNeeded; ssize_t more;
+  auto file_name = findAttribute<FileName>(attributes, FILE_NAME, limitToLoad, &moreNeeded, &more, fd, &buf);
   if (file_name == nullptr) {
     printf("Can't find $FILE_NAME in first MFT entry.\n");
     return 1;
@@ -836,12 +851,15 @@ int main(int argc, char** argv) {
   auto str = arr.to_string();
   printf("Found $FILE_NAME in first MFT entry (resident) with file name: %s\n", str.c_str());
 
-  auto data = findAttribute<Data>(attributes, DATA, limitToLoad, fd, &buf);
+  auto data = findAttribute<Data>(attributes, DATA, limitToLoad, &moreNeeded, &more, fd, &buf);
   if (data == nullptr) {
     printf("Can't find $DATA in first MFT entry.\n");
     return 1;
   }
   printf("Found $DATA in first MFT entry\n");
+  size_t limitToPrint = 2048, actualContentSize = limitToLoad+more;
+  size_t amountToPrint = std::min(limitToPrint, actualContentSize);
+  DumpHex(data, amountToPrint);
 
   _close(fd);
 }
