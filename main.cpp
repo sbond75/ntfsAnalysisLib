@@ -101,7 +101,7 @@ struct ArrayWithLengthIterator {
     return ret;
   }
     
-  T& operator* ()
+  T& operator* () const
   {
     if (entriesRemainingIncludingThisOne == 0) {
       printf("No more entries left in ArrayWithLengthIterator");
@@ -110,7 +110,7 @@ struct ArrayWithLengthIterator {
     return *val;
   }
 
-  T* operator-> ()
+  T* operator-> () const
   {
     if (entriesRemainingIncludingThisOne == 0) {
       printf("No more entries left in ArrayWithLengthIterator");
@@ -322,6 +322,11 @@ struct Data {
 using AttributeContent = std::variant<StandardInformation*, FileName*, Data*>; // Note: there are more than just these
 // Contains `ptr` which will be freed and the superclass which holds type info for the `ptr`.
 class AttributeContentWithFreer: public AttributeContent {
+protected:
+  // https://stackoverflow.com/questions/8967521/class-template-with-template-class-friend-whats-really-going-on-here
+  template<typename U>
+  friend class TypedAttributeContentWithFreer;
+  
   unique_free<void*> ptr;
 public:
   template <typename T>
@@ -335,6 +340,43 @@ public:
   AttributeContentWithFreer(const AttributeContent&& other): ptr(), AttributeContent(other) {}
   
   AttributeContentWithFreer(const AttributeContent& other): ptr(), AttributeContent(other) {}
+};
+// Convenience version of the above.
+template <typename T>
+class TypedAttributeContentWithFreer {
+protected:
+  std::optional<AttributeContent> ac;
+  unique_free<T> ptr;
+public:
+  TypedAttributeContentWithFreer(): ptr(), ac() {}
+  
+  TypedAttributeContentWithFreer(unique_free<T>&& ptr_): ptr(ptr_.release()), ac(ptr_.get()) {}
+
+  TypedAttributeContentWithFreer(TypedAttributeContentWithFreer&& other): ptr(other.ptr.release()), ac((T*)other.ptr.get()) {}
+
+  TypedAttributeContentWithFreer(const TypedAttributeContentWithFreer& other) = delete;
+  
+  TypedAttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
+  
+  TypedAttributeContentWithFreer(const AttributeContent&& other): ptr(), ac(other) {}
+  
+  TypedAttributeContentWithFreer(AttributeContentWithFreer&& other): ptr((T*)other.ptr.release()), ac(other) {}
+  
+  TypedAttributeContentWithFreer(const AttributeContent& other): ptr(), ac(other) {}
+  
+  // Similar interface to std::unique_ptr<T> //
+
+  T* get() const { return ac.has_value() ? nullptr : std::get<T*>(*ac); }
+  
+  T& operator* () const
+  {
+    return *get();
+  }
+
+  T* operator-> () const
+  {
+    return get();
+  }
 };
 struct RunList; struct NTFS;
 
@@ -795,7 +837,7 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool
 
 // Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
 template <typename AttributeContentT>
-AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, bool* out_moreNeeded /*for non-resident*/, ssize_t* out_more /*for non-resident*/, int fd, NTFS* ntfs) {
+TypedAttributeContentWithFreer<AttributeContentT> findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, bool* out_moreNeeded /*for non-resident*/, ssize_t* out_more /*for non-resident*/, int fd, NTFS* ntfs) {
   auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind](auto attr){
     bool ret = false;
     auto process = [&](auto attr) -> bool {
@@ -805,11 +847,13 @@ AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, Attri
     return ret;
   });
   if (attrOfDesiredType == std::end(attributes)) {
-    return nullptr;
+    return TypedAttributeContentWithFreer<AttributeContentT>(); // This attribute wasn't found
   }
-  AttributeContentWithFreer content = std::visit([&](auto v){return AttributeContentWithFreer(v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs));}, *attrOfDesiredType); // Get content()
-  AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
-  return desiredType;
+  TypedAttributeContentWithFreer content = std::visit([&](auto v){return TypedAttributeContentWithFreer<AttributeContentT>(v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs));}, *attrOfDesiredType); // Get content()
+  //AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
+  //return desiredType; // <-- can't do this because it returns free()'ed memory
+  
+  return content;
 }
 
 // "The second #pragma resets the pack value." ( https://stackoverflow.com/questions/24887459/c-c-struct-packing-not-working )
@@ -843,7 +887,7 @@ int main(int argc, char** argv) {
   size_t limitToLoad = 1073741824; //max amount to load from a non-resident attribute
   bool moreNeeded; ssize_t more;
   auto file_name = findAttribute<FileName>(attributes, FILE_NAME, limitToLoad, &moreNeeded, &more, fd, &buf);
-  if (file_name == nullptr) {
+  if (file_name.get() == nullptr) {
     printf("Can't find $FILE_NAME in first MFT entry.\n");
     return 1;
   }
@@ -852,14 +896,14 @@ int main(int argc, char** argv) {
   printf("Found $FILE_NAME in first MFT entry (resident) with file name: %s\n", str.c_str());
 
   auto data = findAttribute<Data>(attributes, DATA, limitToLoad, &moreNeeded, &more, fd, &buf);
-  if (data == nullptr) {
+  if (data.get() == nullptr) {
     printf("Can't find $DATA in first MFT entry.\n");
     return 1;
   }
   printf("Found $DATA in first MFT entry\n");
   size_t limitToPrint = 2048, actualContentSize = limitToLoad+more;
   size_t amountToPrint = std::min(limitToPrint, actualContentSize);
-  DumpHex(data, amountToPrint);
+  DumpHex(data.get(), amountToPrint);
 
   _close(fd);
 }
