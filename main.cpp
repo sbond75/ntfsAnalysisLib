@@ -15,6 +15,7 @@
 #include <locale>         // std::wstring_convert
 #include <codecvt>        // std::codecvt_utf8
 #include <gmpxx.h> // C++ API for The GNU Multiple Precision Arithmetic Library (GMP)
+#include <type_traits>
 
 // Lib //
 
@@ -311,10 +312,16 @@ struct Data {
 };
 using AttributeContent = std::variant<StandardInformation*, FileName*, Data*>; // Note: there are more than just these
 // Contains `ptr` which will be freed and the superclass which holds type info for the `ptr`.
-template <typename T>
 class AttributeContentWithFreer: AttributeContent {
-  unique_free<T> ptr;
-  AttributeContentWithFreer(unique_free<T> ptr_): ptr(ptr_), AttributeContent(ptr_.get()) {}
+  unique_free<void*> ptr;
+public:
+  template <typename T>
+  AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
+
+  template <typename T>
+  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent((T*)other.ptr.get()) {}
+
+  AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
 };
 struct RunList; struct NTFS;
 
@@ -352,7 +359,7 @@ struct ResidentAttribute {
   uint8_t indexedFlag; // ntfsdoc-0.6/concepts/attribute_header.html
   char padding[1]; // ntfsdoc-0.6/concepts/attribute_header.html
 
-  AttributeContent content() const {
+  AttributeContent content(.../*<--placeholder for std::visit, ignore this*/) const {
     uint8_t* contentPtr = (uint8_t*)this + offsetToContent;
     switch (base.typeIdentifier) {
     case STANDARD_INFORMATION:
@@ -365,24 +372,12 @@ struct ResidentAttribute {
   }
 };
 
-// Hack for mpz_t to prevent weird errors assigning to mpz_t
-#pragma pack(1)
-struct MPZCastThing { char caster[sizeof(mpz_t)]; };
-#pragma pack()
-
-// https://stackoverflow.com/questions/5055636/casting-an-object-to-char-for-saving-loading
-template<class To, class From>
-To any_cast(From v)
-{
-    return static_cast<To>(static_cast<void*>(v));
-}
-
 // Wrapper for a GMP multi-precision integer ("z").
 struct MPZWrapper {
   mpz_t z;
   MPZWrapper() { mpz_init(z); }
-  MPZWrapper(mpz_t z_) { *(MPZCastThing*)&z = any_cast<MPZCastThing>(z_); }
-  MPZWrapper(const MPZWrapper&& o) { *(MPZCastThing*)&z = any_cast<MPZCastThing>(o.z); }
+  MPZWrapper(mpz_t z_) { memcpy(&z, &z_, sizeof(mpz_t)); }
+  MPZWrapper(const MPZWrapper&& o) { memcpy(&z, &o.z, sizeof(mpz_t)); }
   MPZWrapper(const MPZWrapper& o) {
     mpz_init(z);
     mpz_set(z, o.z); // Copy it over from `o`
@@ -500,8 +495,7 @@ struct NonResidentAttribute {
   uint64_t actualSizeOfTheAttributeContent;
   uint64_t initializedSizeOfTheAttributeContent; // "Compressed data size." ( ntfsdoc-0.6/concepts/attribute_header.html )
 
-  template <typename T>
-  AttributeContentWithFreer<T> content(size_t limitToLoad, int fd, NTFS* ntfs) const;
+  AttributeContentWithFreer content(size_t limitToLoad, int fd, NTFS* ntfs) const;
 };
 
 using Attribute = std::variant<ResidentAttribute*, NonResidentAttribute*>;
@@ -714,7 +708,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
     printf("MyDataRuns::load: calling realloc(%p, %zu) aka %f MiB\n", buf, totalLength, (float)totalLength / 1024 / 1024);
     buf = realloc(buf, lengthToLoad);
     _lseek(fd, dr.offset, SEEK_CUR); // Seek relative to the last seek
-    _read(fd, buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/, lengthToLoad);
+    _read(fd, (uint8_t*)buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/, lengthToLoad);
     _lseek(fd, -lengthToLoad, SEEK_CUR); // Seek back to the start of the run (since the fd's file offset was changed after the read())
     totalLength += lengthToLoad;
     if (totalLength >= amountToLoad || completeStruct) {
@@ -734,8 +728,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
   return unique_free<void*>((void**)buf);
 }
 
-template <typename T>
-AttributeContentWithFreer<T> NonResidentAttribute::content(size_t limitToLoad, int fd, NTFS* ntfs) const {
+AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, int fd, NTFS* ntfs) const {
   //throw UnhandledValue(); // Not yet implemented actually
 
   // Load all the content virtually (since we can't load it all because it might be massive amounts of data)
@@ -766,11 +759,11 @@ AttributeContentWithFreer<T> NonResidentAttribute::content(size_t limitToLoad, i
   printf("NonResidentAttribute::content: dr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
-    return (unique_free<StandardInformation>)ptr;
+    return AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release()));
   case FILE_NAME:
-    return (unique_free<FileName>)ptr;
+    return AttributeContentWithFreer(unique_free<FileName>((FileName*)ptr.release()));
   case DATA:
-    return (unique_free<Data>)ptr;
+    return AttributeContentWithFreer(unique_free<Data>((Data*)ptr.release()));
   default:
     throw UnhandledValue();
   }
@@ -778,7 +771,7 @@ AttributeContentWithFreer<T> NonResidentAttribute::content(size_t limitToLoad, i
 
 // Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
 template <typename AttributeContentT>
-AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind) {
+AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, int fd, NTFS* ntfs) {
   auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind](auto attr){
     bool ret = false;
     auto process = [&](auto attr) -> bool {
@@ -790,8 +783,8 @@ AttributeContentT* findAttribute(const std::vector<Attribute>& attributes, Attri
   if (attrOfDesiredType == std::end(attributes)) {
     return nullptr;
   }
-  AttributeContent content = std::visit([](auto v){return v->content();}, *attrOfDesiredType); // Get content()
-  AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
+  std::unique_ptr<AttributeContent /*<-- the base class*/> content = std::visit([&](auto v){return std::make_unique<typename std::decay<decltype(std::declval<decltype(v)>()->content((size_t)0, (int)0, (NTFS*)0))>::type>(new (typename std::decay<decltype(std::declval<decltype(v)>()->content((size_t)0, (int)0, (NTFS*)0))>::type)(v->content(limitToLoad, fd, ntfs)));}, *attrOfDesiredType); // Get content()
+  AttributeContentT* desiredType = std::get<AttributeContentT*>(*content); // Unwrap std::variant
   return desiredType;
 }
 
@@ -823,7 +816,8 @@ int main(int argc, char** argv) {
 
 
   // Now that we have the first record, we know it is the $MFT itself (entry 0). So this is a file that references itself! We need to follow its $DATA attribute to get the full MFT contents. ( https://docs.microsoft.com/en-us/windows/win32/devnotes/master-file-table : "The $Mft file contains an unnamed $DATA attribute that is the sequence of MFT record segments, in order." )
-  auto file_name = findAttribute<FileName>(attributes, FILE_NAME);
+  size_t limitToLoad = 1073741824; //max amount to load from a non-resident attribute
+  auto file_name = findAttribute<FileName>(attributes, FILE_NAME, limitToLoad, fd, &buf);
   if (file_name == nullptr) {
     printf("Can't find $FILE_NAME in first MFT entry.\n");
     return 1;
@@ -832,7 +826,7 @@ int main(int argc, char** argv) {
   auto str = arr.to_string();
   printf("Found $FILE_NAME in first MFT entry (resident) with file name: %s\n", str.c_str());
 
-  auto data = findAttribute<Data>(attributes, DATA);
+  auto data = findAttribute<Data>(attributes, DATA, limitToLoad, fd, &buf);
   if (data == nullptr) {
     printf("Can't find $DATA in first MFT entry.\n");
     return 1;
