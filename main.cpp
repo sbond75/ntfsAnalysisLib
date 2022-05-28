@@ -17,6 +17,28 @@
 #include <gmpxx.h> // C++ API for The GNU Multiple Precision Arithmetic Library (GMP)
 #include <type_traits>
 
+// Attempt to ensure little-endian CPU (big-endian CPU could be supported but would require using conversions when reading/writing to structs that represent on-disk data structures from NTFS, such as using https://man7.org/linux/man-pages/man3/endian.3.html )
+// Based on https://stackoverflow.com/questions/4239993/determining-endianness-at-compile-time :
+#include <endian.h> // Or try <sys/param.h>
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __BIG_ENDIAN || \
+    defined(__BIG_ENDIAN__) || \
+    defined(__ARMEB__) || \
+    defined(__THUMBEB__) || \
+    defined(__AARCH64EB__) || \
+    defined(_MIBSEB) || defined(__MIBSEB) || defined(__MIBSEB__)
+// It's a big-endian target architecture
+#error "Big-endian CPU not yet supported"
+#elif defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN || \
+    defined(__LITTLE_ENDIAN__) || \
+    defined(__ARMEL__) || \
+    defined(__THUMBEL__) || \
+    defined(__AARCH64EL__) || \
+    defined(_MIPSEL) || defined(__MIPSEL) || defined(__MIPSEL__)
+// It's a little-endian target architecture
+#else
+#error "I don't know what architecture this is!"
+#endif
+
 // Lib //
 
 // https://stackoverflow.com/questions/8152720/correct-way-to-inherit-from-stdexception
@@ -371,6 +393,7 @@ public:
   // Similar interface to std::unique_ptr<T> //
 
   T* get() const { return ac.has_value() ? std::get<T*>(*ac) : nullptr; }
+  bool isMalloced() const { return ptr.get() != nullptr; }
   
   T& operator* () const
   {
@@ -398,7 +421,7 @@ struct MyDataRuns {
   bool hasMore; // Whether the last run has more data to it but it wasn't loaded, or there are more runs to be loaded but they weren't loaded.
 
   // Loads data from the dataRuns' specified offsets and lengths. See the definition of this function for more information.
-  unique_free<void*> load(size_t bufOffset, void* buf, size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const;
+  unique_free<void*> load(size_t bufOffset, void* buf, size_t amountToLoad, int fd, const NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const;
 };
 #pragma pack(1)
 
@@ -418,13 +441,13 @@ struct ResidentAttribute {
   uint8_t indexedFlag; // ntfsdoc-0.6/concepts/attribute_header.html
   char padding[1]; // ntfsdoc-0.6/concepts/attribute_header.html
 
-  AttributeContent content(.../*<--placeholder for std::visit, ignore this*/) const {
+  std::pair<AttributeContent, std::optional<MyDataRuns> /*placeholder, will be empty*/> content(.../*<--placeholder for std::visit, ignore this*/) const {
     uint8_t* contentPtr = (uint8_t*)this + offsetToContent;
     switch (base.typeIdentifier) {
     case STANDARD_INFORMATION:
-      return (StandardInformation*)contentPtr;
+      return std::make_pair((StandardInformation*)contentPtr, std::optional<MyDataRuns>());
     case FILE_NAME:
-      return (FileName*)contentPtr;
+      return std::make_pair((FileName*)contentPtr, std::optional<MyDataRuns>());
     default:
       throw UnhandledValue();
     }
@@ -591,7 +614,7 @@ struct NonResidentAttribute {
   uint64_t actualSizeOfTheAttributeContent;
   uint64_t initializedSizeOfTheAttributeContent; // "Compressed data size." ( ntfsdoc-0.6/concepts/attribute_header.html )
 
-  AttributeContentWithFreer content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, NTFS* ntfs) const;
+  auto content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const;
 };
 
 using Attribute = std::variant<ResidentAttribute*, NonResidentAttribute*>;
@@ -648,30 +671,10 @@ struct MFTRecord {
 
   static const std::vector<const char*> possibleMagicNumbers;
 
-  // Precondition: This function requires that this MFTRecord was not "fixed up" with applyFixup().
-  // `mftStartInBytes` is gotten by 
-  // `readSoFar` is how much was already read for this struct. If you used getFirstMFTRecord() then this should be `sizeof(MFTRecord)`.
-  std::pair<MFTRecord, void* /*the new buffer for use with `mdr`*/>
-  next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR,
-       int fd, const NTFS* ntfs) const {
-    // Read in data (one cluster at a time) until we reach the fixup at the end of a sector followed by one of the `magicNumber`s in possibleMagicNumbers:
-    bool moreNeeded; ssize_t more;
-    bufForMDR = mdr.load(amountAlreadyLoadedFromMDR, bufForMDR, amountAlreadyLoadedFromMDR + ntfs->bytesPerCluster(), fd, ntfs, &moreNeeded, &more);
-    printf("MFTRecord::next: mdr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
-
-    // Loop through the sectors, checking for the fixup value at the end of each sector. Once that is found, the next sector must contain one of the strings in `possibleMagicNumbers`. // FIXME: This method could technically give false positives. Maybe the MFTRecord continues but some value is still one of the possibleMagicNumbers values...
-    for (uint8_t* currentSector = (uint8_t*)bufForMDR;; currentSector += ntfs->bytesPerSector) {
-      // Sanity check
-      auto fa = fixupArray();
-      for (size_t i = 0; i < fa.length; i++) {
-	assert(fa[i] == currentSector[ntfs->bytesPerSector-numEntriesInFixupArray+i]);
-      }
-
-      // Check the next few bytes
-    }
-
-    return bufForMDR;
-  }
+  std::pair<MFTRecord* /*a pointer within the void* buffer*/,
+	    unique_free<void*> /*the new buffer for use with `mdr`*/>
+  next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/,
+       int fd, const NTFS* ntfs) const;
 
   // Returns the sum of all attributes' sizes.
   size_t sizeOfAllAttributes() const {
@@ -778,14 +781,35 @@ const std::vector<const char*> MFTRecord::possibleMagicNumbers = {
 }; // NOTE: there may be more, add as needed
 
 
+enum MediaDescriptor: uint8_t {
+  HardDisk = 0xF8,
+  HighDensityFloppy = 0xF0
+};
+
 struct NTFS {
   // For more info see ntfsdoc-0.6/files/boot.html since this is $Boot. Also see https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html where it says "Table 2: BPB and extended BPB fields on NTFS volumes".
-  char padding0[0x0B];
+  char x86JumpInstructionToTheBootLoaderRoutine[3]; // ntfsdoc-0.6/files/boot.html
+  char systemID[8]; // "NTFS    "
   uint16_t bytesPerSector;
-  char padding10[0x0D-0x0B-sizeof(uint16_t)];
   uint8_t sectorsPerCluster;
-  char padding20[0x30-0x0D-sizeof(uint8_t)];
-  uint64_t mftOffset; // In clusters (LCNs)
+  uint16_t reservedSectors; // "Reserved" value, "must be 0" (probably for forwards compatibility)
+  char reserved0[3]; // "Reserved" value, "must be 0"
+  char reserved1[2]; // "Reserved" value, "must be 0"
+  MediaDescriptor mediaDescriptor;
+  char reserved2[2]; // "Reserved" value, "must be 0"
+  uint16_t sectorsPerTrack; // "Not used or checked by NTFS." according to the cse.scu.edu website but is something on ntfsdoc-0.6/files/boot.html
+  uint16_t numberOfHeads; // "Not used or checked by NTFS." according to the cse.scu.edu website but is something on ntfsdoc-0.6/files/boot.html
+  char notUsed0[2]; // "Not used or checked by NTFS."
+  char notUsed1[2]; // "Not used or checked by NTFS."
+  char notUsed2[4]; // "Not used or checked by NTFS."
+  char reserved3[4]; // "Reserved" value, "must be 0"  // "Usually 80 00 80 00" + "A value of 80 00 00 00 has been seen on a USB thumb drive which is formatted with NTFS under Windows XP. Note this is removable media and is not partitioned, the drive as a whole is NTFS formatted." ( ntfsdoc-0.6/files/boot.html )
+  uint64_t totalSectors; // "Number of sectors in the volume" ( ntfsdoc-0.6/files/boot.html )
+  uint64_t mftOffset; // In clusters (LCNs)  // "LCN of VCN 0 of the $MFT" ( ntfsdoc-0.6/files/boot.html )
+  uint64_t mftMirrOffset; // "Logical cluster number for the copy of the Master File Table (File $MFTmir)"  // "LCN of VCN 0 of the $MFTMirr" ( ntfsdoc-0.6/files/boot.html )
+  uint32_t clustersPerMFTRecord; // "If the value is less than 7F, then this number is the clusters per Index Buffer. Otherwise, 2x, with x being the negative of this number, is the size of the file record." ( https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html ) aka "This can be negative, which means that the size of the MFT/Index record is smaller than a cluster. In this case the size of the MFT/Index record in bytes is equal to 2^(-1 * Clusters per MFT/Index record). So for example if Clusters per MFT Record is 0xF6 (-10 in decimal), the MFT record size is 2^(-1 * -10) = 2^10 = 1024 bytes." ( ntfsdoc-0.6/files/boot.html )
+  uint32_t clustersPerIndexRecord; // "Clusters per Index Buffer. If the value is less than 7F, then this number is the clusters per Index Buffer. Otherwise, 2x, with x being the negative of this number, is the size of the file record." ( https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html ) aka "This can be negative, which means that the size of the MFT/Index record is smaller than a cluster. In this case the size of the MFT/Index record in bytes is equal to 2^(-1 * Clusters per MFT/Index record). So for example if Clusters per MFT Record is 0xF6 (-10 in decimal), the MFT record size is 2^(-1 * -10) = 2^10 = 1024 bytes." ( ntfsdoc-0.6/files/boot.html )
+  uint64_t volumeSerialNumber;
+  char notUsed4[4]; // "Not used or checked by NTFS."
 
   uint64_t bytesPerCluster() const {
     return bytesPerSector * sectorsPerCluster;
@@ -804,6 +828,23 @@ struct NTFS {
     return buf;
   }
 };
+static_assert(offsetof(NTFS, numberOfHeads) == 0x1A);
+static_assert(offsetof(NTFS, totalSectors) == 0x28);
+static_assert(offsetof(NTFS, mftMirrOffset) == 0x0038);
+static_assert(offsetof(NTFS, notUsed4) == 0x50);
+
+std::pair<MFTRecord* /*a pointer within the void* buffer*/,
+	  unique_free<void*> /*the new buffer for use with `mdr`*/>
+MFTRecord::next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/,
+     int fd, const NTFS* ntfs) const {
+  // Read in a single MFTRecord by reading the number of clusters per MFT record.
+  // FIXME: handle INDX for index records aka "index buffers" -- see NTFS struct and search for these terms for more info.
+  bool moreNeeded; ssize_t more;
+  auto ret = mdr.load(amountAlreadyLoadedFromMDR, bufForMDR, amountAlreadyLoadedFromMDR + ntfs->clustersPerMFTRecord * ntfs->bytesPerCluster(), fd, ntfs, &moreNeeded, &more);
+  bufForMDR = ret.get();
+  printf("MFTRecord::next: mdr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", (intmax_t)more);
+  return std::make_pair((MFTRecord*)((uint8_t*)bufForMDR + amountAlreadyLoadedFromMDR + ntfs->clustersPerMFTRecord * ntfs->bytesPerCluster()), std::move(ret));
+}
 
 // Makes and loads a contiguous buffer from the dataRuns' specified offsets and lengths by dynamically allocating enough memory to hold it, then returning it. The buffer may be incomplete, i.e. if the amount available in `dataRuns` was less than `amountToLoad`. If so, `out_moreNeeded` will be set to true by this function.
 // `bool out_moreNeeded` will be set to true if the `dataRuns` ran out before `amountToLoad` was reached; otherwise, it will be set to false.
@@ -812,7 +853,7 @@ struct NTFS {
 unique_free<void*> MyDataRuns::load(size_t bufOffset /*seek into the data runs by this amount before loading. Set to 0 for the first load. This number must be a multiple of `ntfs->bytesPerCluster()`.*/,
 				    void* buf /*optional existing buffer. Set to nullptr to allocate a new one. If provided (non-null), this function will place more data only starting at buf + `bufOffset` provided.*/,
 				    size_t amountToLoad,
-				    int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const {
+				    int fd, const NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const {
   assert(bufOffset % ntfs->bytesPerCluster() == 0);
   
   _lseek(fd, 0, SEEK_SET); // Go to the start so we can use SEEK_CUR (to do a relative seek) later.
@@ -887,9 +928,7 @@ unique_free<void*> MyDataRuns::load(size_t bufOffset /*seek into the data runs b
   return unique_free<void*>((void**)buf);
 }
 
-AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, NTFS* ntfs) const {
-  //throw UnhandledValue(); // Not yet implemented actually
-
+auto NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const {
   // Load all the content virtually (since we can't load it all because it might be massive amounts of data)
   // Grab the runlist
   RunList* firstRunListEntry = (RunList*)((uint8_t*)this + offsetToTheRunList);
@@ -920,11 +959,11 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool
   printf("NonResidentAttribute::content: dr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
-    return AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release()));
+    return std::make_pair(AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release())), std::make_optional(dr));
   case FILE_NAME:
-    return AttributeContentWithFreer(unique_free<FileName>((FileName*)ptr.release()));
+    return std::make_pair(AttributeContentWithFreer(unique_free<FileName>((FileName*)ptr.release())), std::make_optional(dr));
   case DATA:
-    return AttributeContentWithFreer(unique_free<Data>((Data*)ptr.release()));
+    return std::make_pair(AttributeContentWithFreer(unique_free<Data>((Data*)ptr.release())), std::make_optional(dr));
   default:
     throw UnhandledValue();
   }
@@ -932,7 +971,7 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool
 
 // Returns the first attribute of type `attributeToFind` within `attributes`, or nullptr if not found.
 template <typename AttributeContentT>
-TypedAttributeContentWithFreer<AttributeContentT> findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, bool* out_moreNeeded /*for non-resident*/, ssize_t* out_more /*for non-resident*/, int fd, NTFS* ntfs) {
+std::pair<TypedAttributeContentWithFreer<AttributeContentT>, std::optional<MyDataRuns>> findAttribute(const std::vector<Attribute>& attributes, AttributeTypeIdentifier attributeToFind, size_t limitToLoad /*max amount to load from a non-resident attribute*/, bool* out_moreNeeded /*for non-resident*/, ssize_t* out_more /*for non-resident*/, int fd, NTFS* ntfs) {
   uint8_t* attrAddress = nullptr;
   auto attrOfDesiredType = std::find_if(std::begin(attributes), std::end(attributes), [&attributeToFind, &attrAddress](auto attr){
     bool ret = false;
@@ -947,9 +986,9 @@ TypedAttributeContentWithFreer<AttributeContentT> findAttribute(const std::vecto
     return ret;
   });
   if (attrOfDesiredType == std::end(attributes)) {
-    return TypedAttributeContentWithFreer<AttributeContentT>(); // This attribute wasn't found
+    return std::make_pair(TypedAttributeContentWithFreer<AttributeContentT>(), std::optional<MyDataRuns>()); // This attribute wasn't found
   }
-  TypedAttributeContentWithFreer content = std::visit([&](auto v){return TypedAttributeContentWithFreer<AttributeContentT>(v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs));}, *attrOfDesiredType); // Get content()
+  std::pair<TypedAttributeContentWithFreer<AttributeContentT>, std::optional<MyDataRuns>> content = std::visit([&](auto v){auto pair = v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs); return std::make_pair(TypedAttributeContentWithFreer<AttributeContentT>(pair.first), pair.second);}, *attrOfDesiredType); // Get content()
   //AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
   //return desiredType; // <-- can't do this because it returns free()'ed memory
   
@@ -986,7 +1025,8 @@ int main(int argc, char** argv) {
   // Now that we have the first record, we know it is the $MFT itself (entry 0). So this is a file that references itself! We need to follow its $DATA attribute to get the full MFT contents. ( https://docs.microsoft.com/en-us/windows/win32/devnotes/master-file-table : "The $Mft file contains an unnamed $DATA attribute that is the sequence of MFT record segments, in order." )
   size_t limitToLoad = 1073741824; //max amount to load from a non-resident attribute
   bool moreNeeded; ssize_t more;
-  auto file_name = findAttribute<FileName>(attributes, FILE_NAME, limitToLoad, &moreNeeded, &more, fd, &buf);
+  auto file_name_pair = findAttribute<FileName>(attributes, FILE_NAME, limitToLoad, &moreNeeded, &more, fd, &buf);
+  auto& file_name = file_name_pair.first;
   if (file_name.get() == nullptr) {
     printf("Can't find $FILE_NAME in first MFT entry.\n");
     return 1;
@@ -995,7 +1035,8 @@ int main(int argc, char** argv) {
   auto str = arr.to_string();
   printf("Found $FILE_NAME in first MFT entry with file name: %s\n", str.c_str());
 
-  auto data = findAttribute<Data>(attributes, DATA, limitToLoad, &moreNeeded, &more, fd, &buf);
+  auto data_pair = findAttribute<Data>(attributes, DATA, limitToLoad, &moreNeeded, &more, fd, &buf);
+  auto& data = data_pair.first;
   if (data.get() == nullptr) {
     printf("Can't find $DATA in first MFT entry.\n");
     return 1;
@@ -1004,6 +1045,11 @@ int main(int argc, char** argv) {
   size_t limitToPrint = 2048, actualContentSize = limitToLoad+more;
   size_t amountToPrint = std::min(limitToPrint, actualContentSize);
   DumpHex(data.get(), amountToPrint);
+
+  // Get $VOLUME record
+  assert(data_pair.second.has_value()); // FIXME: if $MFT's $DATA attribute is resident this will fail. So unlikely but still a fixme.
+  assert(data.isMalloced());
+  auto recordAndBuf_mftMirr = rec.next(*data_pair.second, actualContentSize, data.get() /*this is also the buffer due to the above assertion*/, fd, &buf);
 
   _close(fd);
 }
