@@ -398,7 +398,7 @@ struct MyDataRuns {
   bool hasMore; // Whether the last run has more data to it but it wasn't loaded, or there are more runs to be loaded but they weren't loaded.
 
   // Loads data from the dataRuns' specified offsets and lengths. See the definition of this function for more information.
-  unique_free<void*> load(size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const;
+  unique_free<void*> load(size_t bufOffset, void* buf, size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const;
 };
 #pragma pack(1)
 
@@ -646,6 +646,33 @@ struct MFTRecord {
     printf("  \tSize: %ju\n", (uintmax_t)size);
   }
 
+  static const std::vector<const char*> possibleMagicNumbers;
+
+  // Precondition: This function requires that this MFTRecord was not "fixed up" with applyFixup().
+  // `mftStartInBytes` is gotten by 
+  // `readSoFar` is how much was already read for this struct. If you used getFirstMFTRecord() then this should be `sizeof(MFTRecord)`.
+  std::pair<MFTRecord, void* /*the new buffer for use with `mdr`*/>
+  next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR,
+       int fd, const NTFS* ntfs) const {
+    // Read in data (one cluster at a time) until we reach the fixup at the end of a sector followed by one of the `magicNumber`s in possibleMagicNumbers:
+    bool moreNeeded; ssize_t more;
+    bufForMDR = mdr.load(amountAlreadyLoadedFromMDR, bufForMDR, amountAlreadyLoadedFromMDR + ntfs->bytesPerCluster(), fd, ntfs, &moreNeeded, &more);
+    printf("MFTRecord::next: mdr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
+
+    // Loop through the sectors, checking for the fixup value at the end of each sector. Once that is found, the next sector must contain one of the strings in `possibleMagicNumbers`. // FIXME: This method could technically give false positives. Maybe the MFTRecord continues but some value is still one of the possibleMagicNumbers values...
+    for (uint8_t* currentSector = (uint8_t*)bufForMDR;; currentSector += ntfs->bytesPerSector) {
+      // Sanity check
+      auto fa = fixupArray();
+      for (size_t i = 0; i < fa.length; i++) {
+	assert(fa[i] == currentSector[ntfs->bytesPerSector-numEntriesInFixupArray+i]);
+      }
+
+      // Check the next few bytes
+    }
+
+    return bufForMDR;
+  }
+
   // Returns the sum of all attributes' sizes.
   size_t sizeOfAllAttributes() const {
     size_t numAttrs = numAttributes();
@@ -744,6 +771,12 @@ struct MFTRecord {
     return ret;
   }
 };
+const std::vector<const char*> MFTRecord::possibleMagicNumbers = {
+  "FILE", // File record (the MFTRecord class actually implements this only for now) ( ntfsdoc-0.6/concepts/file_record.html )
+  "BAAD", // "Unusable" entry
+  "INDX" // Index record ( ntfsdoc-0.6/concepts/index_record.html )
+}; // NOTE: there may be more, add as needed
+
 
 struct NTFS {
   // For more info see ntfsdoc-0.6/files/boot.html since this is $Boot. Also see https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html where it says "Table 2: BPB and extended BPB fields on NTFS volumes".
@@ -758,8 +791,13 @@ struct NTFS {
     return bytesPerSector * sectorsPerCluster;
   }
 
+  size_t mftOffsetInBytes() const {
+    return mftOffset * bytesPerCluster();
+  }
+
+  // Reads in sizeof(MFTRecord) bytes from `fd` at the MFT starting location specified by this NTFS struct.
   MFTRecord getFirstMFTRecord(int fd) const {
-    off_t offset = mftOffset * bytesPerCluster();
+    off_t offset = mftOffsetInBytes();
     _lseek(fd, offset, SEEK_SET);
     MFTRecord buf;
     _read(fd, &buf, sizeof(MFTRecord));
@@ -770,13 +808,18 @@ struct NTFS {
 // Makes and loads a contiguous buffer from the dataRuns' specified offsets and lengths by dynamically allocating enough memory to hold it, then returning it. The buffer may be incomplete, i.e. if the amount available in `dataRuns` was less than `amountToLoad`. If so, `out_moreNeeded` will be set to true by this function.
 // `bool out_moreNeeded` will be set to true if the `dataRuns` ran out before `amountToLoad` was reached; otherwise, it will be set to false.
 // `out_more` will be set to a positive number indicating how much more was left to be loaded *if* `amountToLoad` was less than the total length of `dataRuns`. It will be set to a negative number if `amountToLoad` is greater than the total length of `dataRuns`. It will be set to zero otherwise.
-// Returns a unique_ptr containing nullptr if `dataRuns.size() == 0`.
-unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const {
+// Returns a unique_ptr containing nullptr if `dataRuns.size() == 0`. If you provided the buffer, you may want to use .release() on the unique_ptr to take back ownership of the memory.
+unique_free<void*> MyDataRuns::load(size_t bufOffset /*seek into the data runs by this amount before loading. Set to 0 for the first load. This number must be a multiple of `ntfs->bytesPerCluster()`.*/,
+				    void* buf /*optional existing buffer. Set to nullptr to allocate a new one. If provided (non-null), this function will place more data only starting at buf + `bufOffset` provided.*/,
+				    size_t amountToLoad,
+				    int fd, NTFS* ntfs, bool* out_moreNeeded, ssize_t* out_more) const {
+  assert(bufOffset % ntfs->bytesPerCluster() == 0);
+  
   _lseek(fd, 0, SEEK_SET); // Go to the start so we can use SEEK_CUR (to do a relative seek) later.
   
   size_t totalLength = 0;
   bool completeStruct = false;
-  void* buf = nullptr;
+  //void* buf = nullptr;
   // Assumptions (for now) //
   *out_more = 0;
   *out_moreNeeded = false;
@@ -787,7 +830,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
   //   *out_moreNeeded = true;
   // }
   
-  for (const MyDataRun& dr : dataRuns) {
+  for (MyDataRun dr /*copy so we can modify it without affecting the original*/ : dataRuns) {
     printf("MyDataRuns::load: processing: dr.offset = %ju, length = %ju\n", (uintmax_t)dr.offset, (uintmax_t)dr.length);
     if (dr.length == 0) {
       // completeStruct = true;
@@ -799,6 +842,21 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
     
     size_t lengthToLoad = dr.length * ntfs->bytesPerCluster();
     printf("MyDataRuns::load: lengthToLoad: %zu bytes\n", lengthToLoad);
+    
+    // Seek further if needed
+    if (dr.offset * ntfs->bytesPerCluster() + totalLength > bufOffset) {
+      // We seeked as far as we need to, but need to modify the offset we start loading at within this run
+      size_t newOffset = (dr.offset * ntfs->bytesPerCluster() + bufOffset) / ntfs->bytesPerCluster();
+      printf("MyDataRuns::load: seeking within data run to get to bufOffset. Now at %ju bytes, was at %ju\n", (uintmax_t)(newOffset * ntfs->bytesPerCluster()), (uintmax_t)(dr.offset * ntfs->bytesPerCluster()));
+      dr.offset = newOffset;
+    }
+    else {
+      // We need to seek more (to the next run)
+      totalLength += lengthToLoad;
+      printf("MyDataRuns::load: seeking to the next data run to try to get past bufOffset. Now at %ju bytes\n", (uintmax_t)totalLength);
+      continue;
+    }
+    
     if (totalLength + lengthToLoad > amountToLoad) { // TODO: untested
       // Limit length of what we load
       lengthToLoad = totalLength - lengthToLoad;
@@ -809,7 +867,7 @@ unique_free<void*> MyDataRuns::load(size_t amountToLoad, int fd, NTFS* ntfs, boo
     printf("MyDataRuns::load: calling realloc(%p, %zu) aka %f MiB\n", buf, totalLength+lengthToLoad, (float)(totalLength+lengthToLoad) / 1024 / 1024);
     buf = realloc(buf, totalLength+lengthToLoad);
     _lseek(fd, dr.offset * ntfs->bytesPerCluster(), SEEK_CUR); // Seek relative to the last seek
-    _read(fd, (uint8_t*)buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/, lengthToLoad);
+    _read(fd, (uint8_t*)buf+totalLength /*load into the position after where we wrote into `buf` last iteration*/ + bufOffset, lengthToLoad);
     _lseek(fd, -lengthToLoad, SEEK_CUR); // Seek back to the start of the run (since the fd's file offset was changed after the read())
     totalLength += lengthToLoad;
     if (totalLength >= amountToLoad || completeStruct) {
@@ -857,7 +915,8 @@ AttributeContentWithFreer NonResidentAttribute::content(size_t limitToLoad, bool
     limitToLoad = std::min(limitToLoad, attrActualSize);
   }
   MyDataRuns dr = LazilyLoaded{firstRunListEntry}.loadUpTo(limitToLoad);
-  auto ptr = dr.load(limitToLoad, fd, ntfs, out_moreNeeded, out_more);
+  size_t bufOffset = 0; unique_free<void*> ptr = nullptr;
+  ptr = dr.load(bufOffset, ptr.get(), limitToLoad, fd, ntfs, out_moreNeeded, out_more);
   printf("NonResidentAttribute::content: dr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
