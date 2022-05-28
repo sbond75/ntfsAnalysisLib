@@ -17,6 +17,13 @@
 #include <gmpxx.h> // C++ API for The GNU Multiple Precision Arithmetic Library (GMP)
 #include <type_traits>
 
+// Required due to a deficiency in C++ std::pair constructors: https://stackoverflow.com/questions/64527951/why-is-stdpair-from-anonymous-object-copying-that-object-instead-of-moving
+template <typename T1, typename T2>
+struct Pair {
+  T1 first;
+  T2 second;
+};
+
 // Attempt to ensure little-endian CPU (big-endian CPU could be supported but would require using conversions when reading/writing to structs that represent on-disk data structures from NTFS, such as using https://man7.org/linux/man-pages/man3/endian.3.html )
 // Based on https://stackoverflow.com/questions/4239993/determining-endianness-at-compile-time :
 #include <endian.h> // Or try <sys/param.h>
@@ -351,29 +358,14 @@ protected:
   
   unique_free<void*> ptr;
 public:
-  // Original:
-  //   template <typename T>
-  //   AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
-  // Should be a constructor but having a templated constructor apparently causes "you just can't call it ever." ( https://stackoverflow.com/questions/3960849/c-template-constructor )
   template <typename T>
-  static AttributeContentWithFreer make(unique_free<T>&& ptr_) {
-    AttributeContentWithFreer this_(AttributeContent(ptr_.get()));
-    this_.ptr.reset((void**)ptr_.release());
-    //return std::move(this_);
-    return AttributeContentWithFreer::make<T>(std::move(this_));
-  }
+  AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
 
-  // Original:
-  //  template <typename T>
-  //  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent(std::get<T*>(other)) {}
-  // Should be a constructor but same issue as above.
   template <typename T>
-  static AttributeContentWithFreer make(AttributeContentWithFreer&& other) {
-    AttributeContentWithFreer this_((AttributeContent)other);
-    this_.ptr.reset((void**)other.ptr.release());
-    return std::move(this_);
-  }
+  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent(std::get<T*>(other)) {}
 
+  AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
+  
   AttributeContentWithFreer(const AttributeContent&& other): ptr(), AttributeContent(other) {}
   
   AttributeContentWithFreer(const AttributeContent& other): ptr(), AttributeContent(other) {}
@@ -629,7 +621,7 @@ struct NonResidentAttribute {
   uint64_t actualSizeOfTheAttributeContent;
   uint64_t initializedSizeOfTheAttributeContent; // "Compressed data size." ( ntfsdoc-0.6/concepts/attribute_header.html )
 
-  std::pair<AttributeContentWithFreer, std::optional<MyDataRuns>> content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const;
+  Pair<AttributeContentWithFreer, std::optional<MyDataRuns>> content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const;
 };
 
 using Attribute = std::variant<ResidentAttribute*, NonResidentAttribute*>;
@@ -943,7 +935,7 @@ unique_free<void*> MyDataRuns::load(size_t bufOffset /*seek into the data runs b
   return unique_free<void*>((void**)buf);
 }
 
-std::pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const {
+Pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const {
   // Load all the content virtually (since we can't load it all because it might be massive amounts of data)
   // Grab the runlist
   RunList* firstRunListEntry = (RunList*)((uint8_t*)this + offsetToTheRunList);
@@ -974,7 +966,11 @@ std::pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttri
   printf("NonResidentAttribute::content: dr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
-    return std::make_pair(AttributeContentWithFreer::make<StandardInformation>(nullptr), std::make_optional(dr));
+    return {AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release())), std::make_optional(dr)};
+  case FILE_NAME:
+    return {AttributeContentWithFreer(unique_free<FileName>((FileName*)ptr.release())), std::make_optional(dr)};
+  case DATA:
+    return {AttributeContentWithFreer(unique_free<Data>((Data*)ptr.release())), std::make_optional(dr)};
   default:
     throw UnhandledValue();
   }
