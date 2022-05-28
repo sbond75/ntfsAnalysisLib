@@ -68,7 +68,7 @@ ssize_t _read(int fd, void* buf, size_t count) {
     perror("read failed");
     throw errno;
   }
-  else if (ret < count) {
+  else if ((size_t)ret < count) {
     perror("read got too few bytes");
     throw errno;
   }
@@ -359,16 +359,16 @@ protected:
   unique_free<void*> ptr;
 public:
   template <typename T>
-  AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
+  AttributeContentWithFreer(unique_free<T>&& ptr_): AttributeContent(ptr_.get()), ptr((void**)ptr_.release()) {}
 
   template <typename T>
-  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent(std::get<T*>(other)) {}
+  AttributeContentWithFreer(AttributeContentWithFreer&& other): AttributeContent(std::get<T*>(other)), ptr(other.ptr.release()) {}
 
   AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
   
-  AttributeContentWithFreer(const AttributeContent&& other): ptr(), AttributeContent(other) {}
+  AttributeContentWithFreer(const AttributeContent&& other): AttributeContent(other), ptr() {}
   
-  AttributeContentWithFreer(const AttributeContent& other): ptr(), AttributeContent(other) {}
+  AttributeContentWithFreer(const AttributeContent& other): AttributeContent(other), ptr() {}
 };
 // Convenience version of the above.
 template <typename T>
@@ -377,9 +377,9 @@ protected:
   std::optional<AttributeContent> ac;
   unique_free<T> ptr;
 public:
-  TypedAttributeContentWithFreer(): ptr(), ac() {}
+  TypedAttributeContentWithFreer(): ac(), ptr() {}
   
-  TypedAttributeContentWithFreer(unique_free<T>&& ptr_): ptr(ptr_.release()), ac(ptr_.get()) {}
+  TypedAttributeContentWithFreer(unique_free<T>&& ptr_): ac(ptr_.get()), ptr(ptr_.release()) {}
 
   TypedAttributeContentWithFreer(TypedAttributeContentWithFreer&& other): ptr(other.ptr.release()) {
     if (other.ac.has_value()) {
@@ -391,11 +391,11 @@ public:
   
   TypedAttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
   
-  TypedAttributeContentWithFreer(const AttributeContent&& other): ptr(), ac(other) {}
+  TypedAttributeContentWithFreer(const AttributeContent&& other): ac(other), ptr() {}
   
-  TypedAttributeContentWithFreer(AttributeContentWithFreer&& other): ptr((T*)other.ptr.release()), ac(other) {}
+  TypedAttributeContentWithFreer(AttributeContentWithFreer&& other): ac(other), ptr((T*)other.ptr.release()) {}
   
-  TypedAttributeContentWithFreer(const AttributeContent& other): ptr(), ac(other) {}
+  TypedAttributeContentWithFreer(const AttributeContent& other): ac(other), ptr() {}
   
   // Similar interface to std::unique_ptr<T> //
 
@@ -559,7 +559,7 @@ struct RunList {
     size_t length = sizeOfLength();
     printf("RunList::length(): "); DumpHex(value, length);
     MPZWrapper z(value, length);
-    return std::move(z);
+    return z;
   }
 
   // Returns the offset of the clusters pointed to by this RunList, in LCNs (logical cluster numbers). This offset is from the start of the NTFS volume *if* this is the first entry in the RunList; otherwise, this is the offset from the `offset()` of the previous entry in the RunList.
@@ -568,7 +568,7 @@ struct RunList {
     size_t length = sizeOfOffset();
     printf("RunList::offset(): "); DumpHex(value, length);
     MPZWrapper z(value, length);
-    return std::move(z);
+    return z;
   }
 
   // Returns the next entry of this RunList, or nullptr if this is the last one.
@@ -1009,7 +1009,7 @@ int main(int argc, char** argv) {
   int fd = _open(argv[1], O_RDONLY);
 
   struct NTFS buf;
-  ssize_t ret = _read(fd, &buf, sizeof(NTFS));
+  _read(fd, &buf, sizeof(NTFS));
   printf("mftOffset: %ju %ju\n", (uintmax_t)buf.mftOffset, (uintmax_t)(buf.mftOffset * buf.bytesPerCluster()));
 
   MFTRecord rec = buf.getFirstMFTRecord(fd);
