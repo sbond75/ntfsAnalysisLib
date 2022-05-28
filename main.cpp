@@ -351,11 +351,28 @@ protected:
   
   unique_free<void*> ptr;
 public:
+  // Original:
+  //   template <typename T>
+  //   AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
+  // Should be a constructor but having a templated constructor apparently causes "you just can't call it ever." ( https://stackoverflow.com/questions/3960849/c-template-constructor )
   template <typename T>
-  AttributeContentWithFreer(unique_free<T>&& ptr_): ptr((void**)ptr_.release()), AttributeContent(ptr_.get()) {}
+  static AttributeContentWithFreer make(unique_free<T>&& ptr_) {
+    AttributeContentWithFreer this_(AttributeContent(ptr_.get()));
+    this_.ptr.reset((void**)ptr_.release());
+    //return std::move(this_);
+    return AttributeContentWithFreer::make<T>(std::move(this_));
+  }
 
+  // Original:
+  //  template <typename T>
+  //  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent(std::get<T*>(other)) {}
+  // Should be a constructor but same issue as above.
   template <typename T>
-  AttributeContentWithFreer(AttributeContentWithFreer&& other): ptr(other.ptr.release()), AttributeContent(std::get<T*>(other)) {}
+  static AttributeContentWithFreer make(AttributeContentWithFreer&& other) {
+    AttributeContentWithFreer this_((AttributeContent)other);
+    this_.ptr.reset((void**)other.ptr.release());
+    return std::move(this_);
+  }
 
   AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
   
@@ -614,7 +631,7 @@ struct NonResidentAttribute {
   uint64_t actualSizeOfTheAttributeContent;
   uint64_t initializedSizeOfTheAttributeContent; // "Compressed data size." ( ntfsdoc-0.6/concepts/attribute_header.html )
 
-  auto content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const;
+  std::pair<AttributeContentWithFreer, std::optional<MyDataRuns>> content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const;
 };
 
 using Attribute = std::variant<ResidentAttribute*, NonResidentAttribute*>;
@@ -928,7 +945,7 @@ unique_free<void*> MyDataRuns::load(size_t bufOffset /*seek into the data runs b
   return unique_free<void*>((void**)buf);
 }
 
-auto NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const {
+std::pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssize_t* out_more, int fd, const NTFS* ntfs) const {
   // Load all the content virtually (since we can't load it all because it might be massive amounts of data)
   // Grab the runlist
   RunList* firstRunListEntry = (RunList*)((uint8_t*)this + offsetToTheRunList);
@@ -959,11 +976,11 @@ auto NonResidentAttribute::content(size_t limitToLoad, bool* out_moreNeeded, ssi
   printf("NonResidentAttribute::content: dr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
-    return std::make_pair(AttributeContentWithFreer(unique_free<StandardInformation>((StandardInformation*)ptr.release())), std::make_optional(dr));
+    return std::make_pair(AttributeContentWithFreer::make(unique_free<StandardInformation>((StandardInformation*)ptr.release())), std::make_optional(dr));
   case FILE_NAME:
-    return std::make_pair(AttributeContentWithFreer(unique_free<FileName>((FileName*)ptr.release())), std::make_optional(dr));
+    return std::make_pair(AttributeContentWithFreer::make(unique_free<FileName>((FileName*)ptr.release())), std::make_optional(dr));
   case DATA:
-    return std::make_pair(AttributeContentWithFreer(unique_free<Data>((Data*)ptr.release())), std::make_optional(dr));
+    return std::make_pair(AttributeContentWithFreer::make(unique_free<Data>((Data*)ptr.release())), std::make_optional(dr));
   default:
     throw UnhandledValue();
   }
@@ -988,7 +1005,7 @@ std::pair<TypedAttributeContentWithFreer<AttributeContentT>, std::optional<MyDat
   if (attrOfDesiredType == std::end(attributes)) {
     return std::make_pair(TypedAttributeContentWithFreer<AttributeContentT>(), std::optional<MyDataRuns>()); // This attribute wasn't found
   }
-  std::pair<TypedAttributeContentWithFreer<AttributeContentT>, std::optional<MyDataRuns>> content = std::visit([&](auto v){auto pair = v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs); return std::make_pair(TypedAttributeContentWithFreer<AttributeContentT>(pair.first), pair.second);}, *attrOfDesiredType); // Get content()
+  std::pair<TypedAttributeContentWithFreer<AttributeContentT>, std::optional<MyDataRuns>> content = std::visit([&](auto v){auto pair = v->content(limitToLoad, out_moreNeeded, out_more, fd, ntfs); return std::make_pair(TypedAttributeContentWithFreer<AttributeContentT>(std::move(pair.first)), std::move(pair.second));}, *attrOfDesiredType); // Get content()
   //AttributeContentT* desiredType = std::get<AttributeContentT*>(content); // Unwrap std::variant
   //return desiredType; // <-- can't do this because it returns free()'ed memory
   
