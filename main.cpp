@@ -374,8 +374,6 @@ public:
     return std::move(this_);
   }
 
-  AttributeContentWithFreer(const AttributeContentWithFreer& other) = delete;
-  
   AttributeContentWithFreer(const AttributeContent&& other): ptr(), AttributeContent(other) {}
   
   AttributeContentWithFreer(const AttributeContent& other): ptr(), AttributeContent(other) {}
@@ -976,11 +974,7 @@ std::pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttri
   printf("NonResidentAttribute::content: dr.load set out_moreNeeded to %s and out_more to %jd\n", *out_moreNeeded == true ? "true" : "false", (intmax_t)*out_more);
   switch (base.typeIdentifier) {
   case STANDARD_INFORMATION:
-    return std::make_pair(AttributeContentWithFreer::make(unique_free<StandardInformation>((StandardInformation*)ptr.release())), std::make_optional(dr));
-  case FILE_NAME:
-    return std::make_pair(AttributeContentWithFreer::make(unique_free<FileName>((FileName*)ptr.release())), std::make_optional(dr));
-  case DATA:
-    return std::make_pair(AttributeContentWithFreer::make(unique_free<Data>((Data*)ptr.release())), std::make_optional(dr));
+    return std::make_pair(AttributeContentWithFreer::make<StandardInformation>(nullptr), std::make_optional(dr));
   default:
     throw UnhandledValue();
   }
