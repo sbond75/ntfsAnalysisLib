@@ -400,7 +400,20 @@ public:
   // Similar interface to std::unique_ptr<T> //
 
   T* get() const { return ac.has_value() ? std::get<T*>(*ac) : nullptr; }
+  T* release() noexcept {
+    if (isMalloced()) {
+      T* retval = ptr.release(); // This still leaves `ac` set to a freed pointer. std::variants like `ac` can't be reset to a default unless you do this, in which case it goes to index 0 of its possible values ( https://en.cppreference.com/w/cpp/utility/variant -- default ctor ):
+      if (ac.has_value())
+	ac = AttributeContent();
+      return retval;
+    }
+    return get();
+  }
   bool isMalloced() const { return ptr.get() != nullptr; }
+  void emplace(unique_free<T>&& ptr_) noexcept {
+    ac = ptr_.get();
+    ptr = std::move(ptr_);
+  }
   
   T& operator* () const
   {
@@ -531,7 +544,8 @@ struct MPZWrapper {
 
     void* (*reallocFunction)(void*, size_t, size_t);
     mp_get_memory_functions(nullptr, &reallocFunction, nullptr);
-    buf = reallocFunction(buf, wordCount * wordSize, maxWordCount * wordSize); // buf, old size, new size
+    outRaw.reset((void**)reallocFunction((void*)outRaw.release(), wordCount * wordSize, maxWordCount * wordSize)); // buf, old size, new size
+    buf = (void*)outRaw.get();
     // Zero out the rest
     memset((uint8_t*)buf + (wordCount * wordSize), 0, (maxWordCount * wordSize - wordCount * wordSize)); 
     printf("MPZWrapper::toSizeT: result after realloc: "); DumpHex(outRaw.get(), maxWordCount);
@@ -679,7 +693,8 @@ struct MFTRecord {
   static const std::vector<const char*> possibleMagicNumbers;
 
   std::pair<MFTRecord* /*a pointer within the void* buffer*/,
-	    unique_free<void*> /*the new buffer for use with `mdr`*/>
+	    std::pair<unique_free<void*> /*the new buffer for use with `mdr`*/,
+		      ssize_t /*`more` -- what was loaded from disk by this function into (a possibly realloc()'ed) `bufForMDR`*/>>
   next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/,
        int fd, const NTFS* ntfs) const;
 
@@ -801,22 +816,38 @@ struct NTFS {
   uint8_t sectorsPerCluster;
   uint16_t reservedSectors; // "Reserved" value, "must be 0" (probably for forwards compatibility)
   char reserved0[3]; // "Reserved" value, "must be 0"
-  char reserved1[2]; // "Reserved" value, "must be 0"
+  char reserved10[2]; // "Reserved" value, "must be 0"
   MediaDescriptor mediaDescriptor;
-  char reserved2[2]; // "Reserved" value, "must be 0"
+  char reserved20[2]; // "Reserved" value, "must be 0"
   uint16_t sectorsPerTrack; // "Not used or checked by NTFS." according to the cse.scu.edu website but is something on ntfsdoc-0.6/files/boot.html
   uint16_t numberOfHeads; // "Not used or checked by NTFS." according to the cse.scu.edu website but is something on ntfsdoc-0.6/files/boot.html
   char notUsed0[2]; // "Not used or checked by NTFS."
-  char notUsed1[2]; // "Not used or checked by NTFS."
-  char notUsed2[4]; // "Not used or checked by NTFS."
-  char reserved3[4]; // "Reserved" value, "must be 0"  // "Usually 80 00 80 00" + "A value of 80 00 00 00 has been seen on a USB thumb drive which is formatted with NTFS under Windows XP. Note this is removable media and is not partitioned, the drive as a whole is NTFS formatted." ( ntfsdoc-0.6/files/boot.html )
+  char notUsed10[2]; // "Not used or checked by NTFS."
+  char notUsed20[4]; // "Not used or checked by NTFS."
+  char reserved30[4]; // "Reserved" value, "must be 0"  // "Usually 80 00 80 00" + "A value of 80 00 00 00 has been seen on a USB thumb drive which is formatted with NTFS under Windows XP. Note this is removable media and is not partitioned, the drive as a whole is NTFS formatted." ( ntfsdoc-0.6/files/boot.html )
   uint64_t totalSectors; // "Number of sectors in the volume" ( ntfsdoc-0.6/files/boot.html )
   uint64_t mftOffset; // In clusters (LCNs)  // "LCN of VCN 0 of the $MFT" ( ntfsdoc-0.6/files/boot.html )
   uint64_t mftMirrOffset; // "Logical cluster number for the copy of the Master File Table (File $MFTmir)"  // "LCN of VCN 0 of the $MFTMirr" ( ntfsdoc-0.6/files/boot.html )
-  uint32_t clustersPerMFTRecord; // "If the value is less than 7F, then this number is the clusters per Index Buffer. Otherwise, 2x, with x being the negative of this number, is the size of the file record." ( https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html ) aka "This can be negative, which means that the size of the MFT/Index record is smaller than a cluster. In this case the size of the MFT/Index record in bytes is equal to 2^(-1 * Clusters per MFT/Index record). So for example if Clusters per MFT Record is 0xF6 (-10 in decimal), the MFT record size is 2^(-1 * -10) = 2^10 = 1024 bytes." ( ntfsdoc-0.6/files/boot.html )
-  uint32_t clustersPerIndexRecord; // "Clusters per Index Buffer. If the value is less than 7F, then this number is the clusters per Index Buffer. Otherwise, 2x, with x being the negative of this number, is the size of the file record." ( https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html ) aka "This can be negative, which means that the size of the MFT/Index record is smaller than a cluster. In this case the size of the MFT/Index record in bytes is equal to 2^(-1 * Clusters per MFT/Index record). So for example if Clusters per MFT Record is 0xF6 (-10 in decimal), the MFT record size is 2^(-1 * -10) = 2^10 = 1024 bytes." ( ntfsdoc-0.6/files/boot.html )
+  uint8_t _clustersPerMFTFileRecord; // "If the value is less than 7F, then this number is the clusters per Index Buffer. Otherwise, 2x, with x being the negative of this number, is the size of the file record." ( https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html ) aka "This can be negative, which means that the size of the MFT/Index record is smaller than a cluster. In this case the size of the MFT/Index record in bytes is equal to 2^(-1 * Clusters per MFT/Index record). So for example if Clusters per MFT Record is 0xF6 (-10 in decimal), the MFT record size is 2^(-1 * -10) = 2^10 = 1024 bytes." ( ntfsdoc-0.6/files/boot.html )
+  char notUsed30[3]; // "Not used or checked by NTFS."
+  size_t bytesPerMFTFileRecord() const { // Returns the actual amount obeying the above description.
+    if ((int8_t)_clustersPerMFTFileRecord < 0) {
+      uint8_t exp = -1*(int8_t)_clustersPerMFTFileRecord;
+      return 1 << exp; // Is the same as 2 to the power of `exp`. (std::pow is only really good for floating point numbers)  // This is now in bytes instead of clusters because it is smaller than a single cluster usually.
+    }
+    return _clustersPerMFTFileRecord * bytesPerCluster();
+  }
+  uint8_t _clustersPerMFTIndexRecord; // "Clusters per Index Buffer. If the value is less than 7F, then this number is the clusters per Index Buffer. Otherwise, 2x, with x being the negative of this number, is the size of the file record." ( https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html ) aka "This can be negative, which means that the size of the MFT/Index record is smaller than a cluster. In this case the size of the MFT/Index record in bytes is equal to 2^(-1 * Clusters per MFT/Index record). So for example if Clusters per MFT Record is 0xF6 (-10 in decimal), the MFT record size is 2^(-1 * -10) = 2^10 = 1024 bytes." ( ntfsdoc-0.6/files/boot.html )
+  char notUsed40[3]; // "Not used or checked by NTFS."
+  size_t bytesPerMFTIndexRecord() const { // Returns the actual amount obeying the above description.
+    if ((int8_t)_clustersPerMFTIndexRecord < 0) {
+      uint8_t exp = -1*(int8_t)_clustersPerMFTIndexRecord;
+      return 1 << exp;
+    }
+    return _clustersPerMFTIndexRecord * bytesPerCluster();
+  }
   uint64_t volumeSerialNumber;
-  char notUsed4[4]; // "Not used or checked by NTFS."
+  char notUsed50[4]; // "Not used or checked by NTFS."
 
   uint64_t bytesPerCluster() const {
     return bytesPerSector * sectorsPerCluster;
@@ -838,19 +869,21 @@ struct NTFS {
 static_assert(offsetof(NTFS, numberOfHeads) == 0x1A);
 static_assert(offsetof(NTFS, totalSectors) == 0x28);
 static_assert(offsetof(NTFS, mftMirrOffset) == 0x0038);
-static_assert(offsetof(NTFS, notUsed4) == 0x50);
+static_assert(offsetof(NTFS, notUsed50) == 0x50);
 
 std::pair<MFTRecord* /*a pointer within the void* buffer*/,
-	  unique_free<void*> /*the new buffer for use with `mdr`*/>
+	  std::pair<unique_free<void*> /*the new buffer for use with `mdr`*/,
+		    ssize_t /*`more` -- what was loaded from disk by this function into (a possibly realloc()'ed) `bufForMDR`*/>>
 MFTRecord::next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/,
      int fd, const NTFS* ntfs) const {
   // Read in a single MFTRecord by reading the number of clusters per MFT record.
   // FIXME: handle INDX for index records aka "index buffers" -- see NTFS struct and search for these terms for more info.
   bool moreNeeded; ssize_t more;
-  auto ret = mdr.load(amountAlreadyLoadedFromMDR, bufForMDR, amountAlreadyLoadedFromMDR + ntfs->clustersPerMFTRecord * ntfs->bytesPerCluster(), fd, ntfs, &moreNeeded, &more);
+  printf("MFTRecord::next: calling mdr.load to get %ju more bytes\n", (uintmax_t)ntfs->bytesPerMFTFileRecord());
+  auto ret = mdr.load(amountAlreadyLoadedFromMDR, bufForMDR, ntfs->bytesPerMFTFileRecord(), fd, ntfs, &moreNeeded, &more);
   bufForMDR = ret.get();
   printf("MFTRecord::next: mdr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", (intmax_t)more);
-  return std::make_pair((MFTRecord*)((uint8_t*)bufForMDR + amountAlreadyLoadedFromMDR + ntfs->clustersPerMFTRecord * ntfs->bytesPerCluster()), std::move(ret));
+  return std::make_pair((MFTRecord*)((uint8_t*)bufForMDR + amountAlreadyLoadedFromMDR + ntfs->bytesPerMFTFileRecord()), std::make_pair(std::move(ret), more));
 }
 
 // Makes and loads a contiguous buffer from the dataRuns' specified offsets and lengths by dynamically allocating enough memory to hold it, then returning it. The buffer may be incomplete, i.e. if the amount available in `dataRuns` was less than `amountToLoad`. If so, `out_moreNeeded` will be set to true by this function.
@@ -892,22 +925,25 @@ unique_free<void*> MyDataRuns::load(size_t bufOffset /*seek into the data runs b
     printf("MyDataRuns::load: lengthToLoad: %zu bytes\n", lengthToLoad);
     
     // Seek further if needed
-    if (dr.offset * ntfs->bytesPerCluster() + totalLength > bufOffset) {
-      // We seeked as far as we need to, but need to modify the offset we start loading at within this run
-      size_t newOffset = (dr.offset * ntfs->bytesPerCluster() + bufOffset) / ntfs->bytesPerCluster();
-      printf("MyDataRuns::load: seeking within data run to get to bufOffset. Now at %ju bytes, was at %ju\n", (uintmax_t)(newOffset * ntfs->bytesPerCluster()), (uintmax_t)(dr.offset * ntfs->bytesPerCluster()));
-      dr.offset = newOffset;
+    if (totalLength + lengthToLoad >= bufOffset) { // TODO: untested
+      // We seeked enough and are in the run we left off in "last time"
+      // So now we need to load in the rest of this run
+      size_t newOffsetBytes = dr.offset * ntfs->bytesPerCluster() + (bufOffset - totalLength);
+      printf("MyDataRuns::load: seeked past enough runs. Now seeking within data run to get to bufOffset. Now at %ju bytes, was at %ju\n", (uintmax_t)(newOffsetBytes), (uintmax_t)(dr.offset * ntfs->bytesPerCluster()));
+      lengthToLoad = lengthToLoad - (newOffsetBytes - dr.offset * ntfs->bytesPerCluster());
+      dr.offset = newOffsetBytes / ntfs->bytesPerCluster();
+      printf("MyDataRuns::load: lengthToLoad: adjusted to %zu bytes\n", lengthToLoad);
     }
-    else {
+    else { // TODO: untested
       // We need to seek more (to the next run)
       totalLength += lengthToLoad;
-      printf("MyDataRuns::load: seeking to the next data run to try to get past bufOffset. Now at %ju bytes\n", (uintmax_t)totalLength);
+      printf("MyDataRuns::load: seeking to the next data run to try to get past bufOffset (%ju). Now at %ju bytes\n", (uintmax_t)bufOffset, (uintmax_t)totalLength);
       continue;
     }
     
     if (totalLength + lengthToLoad > amountToLoad) { // TODO: untested
       // Limit length of what we load
-      lengthToLoad = totalLength - lengthToLoad;
+      lengthToLoad = amountToLoad - totalLength;
       printf("MyDataRuns::load: limiting length to %zu bytes\n", lengthToLoad);
       completeStruct = true;
       *out_more = lengthToLoad;
@@ -1017,14 +1053,14 @@ int main(int argc, char** argv) {
   printf("numberOfThisMFTRecord: %ju , sequenceNumber: %ju ; fileReferenceAddress of first MFT record: computed %ju stored %ju\n",(uintmax_t)rec.numberOfThisMFTRecord, (uintmax_t)rec.sequenceNumber, (uintmax_t)rec.computedFileReferenceAddress(), (uintmax_t)rec.fileReferenceToTheBase_FILE_record);
 
   auto attributes = rec.attributes();
-  for (auto& v : attributes) {
-    // https://stackoverflow.com/questions/63482070/how-can-i-code-something-like-a-switch-for-stdvariant
-    std::visit(overloaded{
-	[](std::monostate&) /* Empty variant */ {},
-	[](ResidentAttribute* v){BREAKPOINT;},
-	[](NonResidentAttribute* v){BREAKPOINT;},
-      }, v);
-  }
+  // for (auto& v : attributes) {
+  //   // https://stackoverflow.com/questions/63482070/how-can-i-code-something-like-a-switch-for-stdvariant
+  //   std::visit(overloaded{
+  // 	[](std::monostate&) /* Empty variant */ {},
+  // 	[](ResidentAttribute* v){BREAKPOINT;},
+  // 	[](NonResidentAttribute* v){BREAKPOINT;},
+  //     }, v);
+  // }
 
   rec.hexDump();
 
@@ -1056,7 +1092,18 @@ int main(int argc, char** argv) {
   // Get $VOLUME record
   assert(data_pair.second.has_value()); // FIXME: if $MFT's $DATA attribute is resident this will fail. So unlikely but still a fixme.
   assert(data.isMalloced());
-  auto recordAndBuf_mftMirr = rec.next(*data_pair.second, actualContentSize, data.get() /*this is also the buffer due to the above assertion*/, fd, &buf);
+  auto recordAndBufAndMore_mftMirr = rec.next(*data_pair.second, actualContentSize, data.release() /*this is also the buffer due to the above assertion*/, fd, &buf);
+  MFTRecord* mftMirr = recordAndBufAndMore_mftMirr.first;
+  data.emplace(unique_free<Data>((Data*)recordAndBufAndMore_mftMirr.second.first.release()));
+  more = recordAndBufAndMore_mftMirr.second.second;
+  actualContentSize += more;
+  auto recordAndBufAndMore_logFile = mftMirr->next(*data_pair.second, actualContentSize, data.release(), fd, &buf);
+  MFTRecord* logFile = recordAndBufAndMore_logFile.first;
+  data.emplace(unique_free<Data>((Data*)recordAndBufAndMore_logFile.second.first.release()));
+  more = recordAndBufAndMore_logFile.second.second;
+  actualContentSize += more;
+  auto recordAndBufAndMore_volume = logFile->next(*data_pair.second, actualContentSize, data.release(), fd, &buf);
+  
 
   _close(fd);
 }

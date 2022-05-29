@@ -20,5 +20,6 @@ mkShell {
     my-python-packages
     gcc
     gmp
+    valgrind
   ];
 }
