@@ -695,8 +695,8 @@ struct MFTRecord {
   std::pair<MFTRecord* /*a pointer within the void* buffer*/,
 	    std::pair<unique_free<void*> /*the new buffer for use with `mdr`*/,
 		      ssize_t /*`more` -- what was loaded from disk by this function into (a possibly realloc()'ed) `bufForMDR`*/>>
-  next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/,
-       int fd, const NTFS* ntfs) const;
+  next(const MyDataRuns& mdr, size_t totalAmountLoadedAlready, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/, size_t* out_seekedAmount,
+		int fd, const NTFS* ntfs) const;
 
   // Returns the sum of all attributes' sizes.
   size_t sizeOfAllAttributes() const {
@@ -874,15 +874,16 @@ static_assert(offsetof(NTFS, notUsed50) == 0x50);
 std::pair<MFTRecord* /*a pointer within the void* buffer*/,
 	  std::pair<unique_free<void*> /*the new buffer for use with `mdr`*/,
 		    ssize_t /*`more` -- what was loaded from disk by this function into (a possibly realloc()'ed) `bufForMDR`*/>>
-MFTRecord::next(const MyDataRuns& mdr, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/,
+MFTRecord::next(const MyDataRuns& mdr, size_t totalAmountLoadedAlready, size_t amountAlreadyLoadedFromMDR, void* bufForMDR /*must be a malloc()'ed buffer*/, size_t* out_seekedAmount,
      int fd, const NTFS* ntfs) const {
   // Read in a single MFTRecord by reading the number of clusters per MFT record.
   // FIXME: handle INDX for index records aka "index buffers" -- see NTFS struct and search for these terms for more info.
   bool moreNeeded; ssize_t more;
   printf("MFTRecord::next: calling mdr.load to get %ju more bytes\n", (uintmax_t)ntfs->bytesPerMFTFileRecord());
-  auto ret = mdr.load(amountAlreadyLoadedFromMDR, bufForMDR, ntfs->bytesPerMFTFileRecord(), fd, ntfs, &moreNeeded, &more);
+  auto ret = mdr.load(totalAmountLoadedAlready, bufForMDR, ntfs->bytesPerMFTFileRecord(), fd, ntfs, &moreNeeded, &more);
   bufForMDR = ret.get();
   printf("MFTRecord::next: mdr.load set moreNeeded to %s and more to %jd\n", moreNeeded == true ? "true" : "false", (intmax_t)more);
+  *out_seekedAmount = ntfs->bytesPerMFTFileRecord();
   return std::make_pair((MFTRecord*)((uint8_t*)bufForMDR + amountAlreadyLoadedFromMDR + ntfs->bytesPerMFTFileRecord()), std::make_pair(std::move(ret), more));
 }
 
@@ -1092,18 +1093,28 @@ int main(int argc, char** argv) {
   // Get $VOLUME record
   assert(data_pair.second.has_value()); // FIXME: if $MFT's $DATA attribute is resident this will fail. So unlikely but still a fixme.
   assert(data.isMalloced());
-  auto recordAndBufAndMore_mftMirr = rec.next(*data_pair.second, actualContentSize, data.release() /*this is also the buffer due to the above assertion*/, fd, &buf);
+  size_t amountAlreadyLoadedFromMDR = 0, seekedAmount;
+  auto recordAndBufAndMore_mftMirr = rec.next(*data_pair.second, actualContentSize, amountAlreadyLoadedFromMDR, data.release() /*this is also the buffer due to the above assertion*/, &seekedAmount, fd, &buf);
   MFTRecord* mftMirr = recordAndBufAndMore_mftMirr.first;
   data.emplace(unique_free<Data>((Data*)recordAndBufAndMore_mftMirr.second.first.release()));
   more = recordAndBufAndMore_mftMirr.second.second;
   actualContentSize += more;
-  auto recordAndBufAndMore_logFile = mftMirr->next(*data_pair.second, actualContentSize, data.release(), fd, &buf);
+  amountAlreadyLoadedFromMDR += seekedAmount;
+  mftMirr->hexDump();
+  auto recordAndBufAndMore_logFile = mftMirr->next(*data_pair.second, actualContentSize, amountAlreadyLoadedFromMDR, data.release(), &seekedAmount, fd, &buf);
   MFTRecord* logFile = recordAndBufAndMore_logFile.first;
   data.emplace(unique_free<Data>((Data*)recordAndBufAndMore_logFile.second.first.release()));
   more = recordAndBufAndMore_logFile.second.second;
   actualContentSize += more;
-  auto recordAndBufAndMore_volume = logFile->next(*data_pair.second, actualContentSize, data.release(), fd, &buf);
-  
+  amountAlreadyLoadedFromMDR += seekedAmount;
+  logFile->hexDump();
+  auto recordAndBufAndMore_volume = logFile->next(*data_pair.second, actualContentSize, amountAlreadyLoadedFromMDR, data.release(), &seekedAmount, fd, &buf);
+  MFTRecord* volume = recordAndBufAndMore_volume.first;
+  data.emplace(unique_free<Data>((Data*)recordAndBufAndMore_volume.second.first.release()));
+  more = recordAndBufAndMore_volume.second.second;
+  actualContentSize += more;
+  amountAlreadyLoadedFromMDR += seekedAmount;
+  volume->hexDump();
 
   _close(fd);
 }
