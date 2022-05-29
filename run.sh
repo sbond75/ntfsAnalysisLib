@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-./a.out /dev/loop3
+./a.out /dev/loop4

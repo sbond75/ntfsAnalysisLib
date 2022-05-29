@@ -3,7 +3,8 @@
 v='print *v; print/x *v'
 noArgs="$1"
 if [ "$noArgs" != "1" ]; then
-    args=$(./cmds2 "b _close; run; print attributes.size(); $v; c; $v; c; $v; c; $v; c; fin; print buf; print rec; print attributes")
+    #extras="$v; c; $v; c; $v; c; $v; c; fin;"
+    args=$(./cmds2 "b _close; run; print attributes.size(); $extras print buf; print rec; print attributes; print *(VolumeInformation*)volume_information_pair.first.ac._M_payload")
 fi
 #args=$(eval echo $args)
 IFS=$'\n' arr=( $(xargs -n1 <<<"$args") ) # https://stackoverflow.com/questions/37372225/convert-a-string-into-an-array-with-bash-honoring-quotes-for-grouping

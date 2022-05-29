@@ -348,7 +348,32 @@ static_assert(sizeof(FileName) == 0x42); // Based on the filename in Unicode bei
 struct Data {
   // Contains anything! For a ResidentAttribute containing this, use `sizeOfContent` to tell how long this Data is. TODO: NonResidentAttribute.
 };
-using AttributeContent = std::variant<StandardInformation*, FileName*, Data*>; // Note: there are more than just these
+enum VolumeInformationFlags: uint16_t {
+  Dirty = 0x0001, // "When the Dirty Flag is set, Windows NT must perform the chkdsk /F command on the volume when it next boots."
+  ResizeLogFile = 0x0002,
+  UpgradeOnMount = 0x0004,
+  MountedOnNT4 = 0x0008,
+  DeleteUSN_underway = 0x0010,
+  RepairObjectIds = 0x0020,
+  ModifiedByChkdsk = 0x8000
+};
+// ntfsdoc-0.6/files/volume.html -> ntfsdoc-0.6/attributes/volume_information.html
+// "Indicates the version and the state of the volume."
+struct VolumeInformation {
+  char maybeAlwaysZero0[8];
+
+  // Version numbers:
+  // Operating System	NTFS Version
+  // Windows NT		1.2
+  // Windows 2000	3.0
+  // Windows XP		3.1
+  char majorVersionNumber;
+  char minorVersionNumber;
+  
+  VolumeInformationFlags flags;
+  char maybeAlwaysZero10[4];
+};
+using AttributeContent = std::variant<StandardInformation*, FileName*, Data*, VolumeInformation*>; // Note: there are more than just these
 // Contains `ptr` which will be freed and the superclass which holds type info for the `ptr`.
 class AttributeContentWithFreer: public AttributeContent {
 protected:
@@ -468,6 +493,8 @@ struct ResidentAttribute {
       return std::make_pair((StandardInformation*)contentPtr, std::optional<MyDataRuns>());
     case FILE_NAME:
       return std::make_pair((FileName*)contentPtr, std::optional<MyDataRuns>());
+    case VOLUME_INFORMATION:
+      return std::make_pair((VolumeInformation*)contentPtr, std::optional<MyDataRuns>());
     default:
       throw UnhandledValue();
     }
@@ -987,6 +1014,9 @@ Pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttribute:
     break;
   case DATA:
     break;
+  case VOLUME_INFORMATION:
+    attrActualSize = sizeof(VolumeInformation); // "As defined in $AttrDef, this attribute has a minimum and a maximum size of 12 bytes." ( ntfsdoc-0.6/attributes/volume_information.html )
+    break;
   default:
     throw UnhandledValue();
   }
@@ -1008,6 +1038,8 @@ Pair<AttributeContentWithFreer, std::optional<MyDataRuns>> NonResidentAttribute:
     return {AttributeContentWithFreer(unique_free<FileName>((FileName*)ptr.release())), std::make_optional(dr)};
   case DATA:
     return {AttributeContentWithFreer(unique_free<Data>((Data*)ptr.release())), std::make_optional(dr)};
+  case VOLUME_INFORMATION:
+    return {AttributeContentWithFreer(unique_free<VolumeInformation>((VolumeInformation*)ptr.release())), std::make_optional(dr)};
   default:
     throw UnhandledValue();
   }
@@ -1116,5 +1148,10 @@ int main(int argc, char** argv) {
   amountAlreadyLoadedFromMDR += seekedAmount;
   volume->hexDump();
 
+  // TODO: make limitToLoad, etc. all use the existing buf properly here:
+  auto volume_information_pair = findAttribute<VolumeInformation>(volume->attributes(), VOLUME_INFORMATION, limitToLoad, &moreNeeded, &more, fd, &buf);
+  
+
+  BREAKPOINT;
   _close(fd);
 }
