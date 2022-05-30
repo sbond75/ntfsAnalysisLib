@@ -110,6 +110,7 @@ int _close(int fd) {
 #pragma pack(1)
 
 // Most of this is based on the descriptions on https://www.cse.scu.edu/~tschwarz/coen252_07Fall/Lectures/NTFS.html
+// Some more info can also be found in Apple's open source NTFS driver ( https://opensource.apple.com/source/ntfs/ntfs-98.1.1/kext/ntfs_layout.h.auto.html ) and probably Linux's ( https://github.com/torvalds/linux/tree/master/fs/ntfs3 or https://github.com/torvalds/linux/tree/master/fs/ntfs , not sure what the difference between `ntfs` and `ntfs3` are).
 
 enum MFTEntryFlags: uint16_t {
   RecordInUse = 0x01, // If this is set, the entry is *not* deleted. If it is not set, the record can be reused because it points to a deleted file! ("When a file is created, an unused FILE record can be re-used for it, but its sequence number is [if non-zero] incremented by one [and skipping 0]. This mechanism allows NTFS to check that file references don't point to deleted files." -- ntfsdoc-0.6/concepts/file_record.html )
@@ -1147,11 +1148,21 @@ int main(int argc, char** argv) {
   actualContentSize += more;
   amountAlreadyLoadedFromMDR += seekedAmount;
   volume->hexDump();
+  volume->applyFixup(buf.bytesPerSector);
 
   // TODO: make limitToLoad, etc. all use the existing buf properly here:
   auto volume_information_pair = findAttribute<VolumeInformation>(volume->attributes(), VOLUME_INFORMATION, limitToLoad, &moreNeeded, &more, fd, &buf);
   
+  // Compute how many sectors from the start of the disk that the $VOLUME_INFORMATION attribute is:
+  // FIXME: it is assumed the $VOLUME_INFORMATION is resident here; technically but unlikely it could be non-resident. If it were non-resident, the volume_information_pair.first.get() pointer would be in another block of memory allocated, making this subtraction wrong:
+  size_t bytesFromVolumeInformationToFirstEntry = (uint8_t*)volume_information_pair.first.get() - (uint8_t*)data.get(); // `data.get()` is the start of the MFT
+  size_t bytesFromVolumeStartToVolInfo = bytesFromVolumeInformationToFirstEntry + buf.mftOffsetInBytes();
+  // Add the offset to the offsetof(VolumeInformation, flags)
+  size_t bytesFromVolumeStartToVolFlags = bytesFromVolumeStartToVolInfo + offsetof(VolumeInformation, flags);
+  size_t sectorsFromVolumeStartToVolFlags = bytesFromVolumeStartToVolFlags / buf.bytesPerSector;
+  size_t bytesLeftOverWithinTheSectorOfVolFlags = bytesFromVolumeStartToVolFlags % buf.bytesPerSector; // Get the bytes remaining within the sector that the $VOLUME_INFORMATION is contained in.
+  printf("sectorsFromVolumeStartToVolFlags: %ju, bytesPerSector: %ju, bytesLeftOverWithinTheSectorOfVolFlags: %ju\n", (uintmax_t)sectorsFromVolumeStartToVolFlags, (uintmax_t)buf.bytesPerSector, (uintmax_t)bytesLeftOverWithinTheSectorOfVolFlags);
 
-  BREAKPOINT;
+  //BREAKPOINT;
   _close(fd);
 }
