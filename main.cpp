@@ -74,6 +74,10 @@ ssize_t _read(int fd, void* buf, size_t count) {
   }
   return ret;
 }
+unsigned long long g_seekBase = 0;
+void _lseek_setSeekBase(unsigned long long seekInFD) {
+  g_seekBase = seekInFD;
+}
 off_t _lseek(int fd, off_t offset, int whence) {
   // Get current offset
   off_t origOffsetFromStartOfFile = lseek(fd, 0, SEEK_CUR); // (Shouldn't change the offset in the file, but returns the offset from the start as lseek usually does.)
@@ -82,14 +86,14 @@ off_t _lseek(int fd, off_t offset, int whence) {
     throw errno;
   }
   
-  off_t ret = lseek(fd, offset, whence);
+  off_t ret = lseek(fd, (whence == SEEK_SET ? g_seekBase : 0) + offset, whence);
   off_t desired;
   if (ret == -1) {
     perror("lseek failed");
     throw errno;
   }
   else if ((whence == SEEK_CUR && ret != (desired=origOffsetFromStartOfFile + offset)) ||
-	   (whence == SEEK_SET && ret != (desired=offset))) {
+	   (whence == SEEK_SET && ret != (desired=offset+g_seekBase))) {
     fprintf(stderr, "lseek didn't go to the expected offset: expected %jd but got %jd\n", (intmax_t)desired, (intmax_t)ret);
     throw errno;
   }
@@ -1076,7 +1080,17 @@ std::pair<TypedAttributeContentWithFreer<AttributeContentT>, std::optional<MyDat
 #pragma pack()
 
 int main(int argc, char** argv) {
+  if (argc < 2) {
+    printf("Need at least one argument: the file to open as an NTFS partition. Alternatively, provide any file and an offset to seek within the file (you can also provide an entire disk, then seek to the NTFS partition).");
+    return 1;
+  }
   int fd = _open(argv[1], O_RDONLY);
+  if (argc > 2) {
+    unsigned long long seekInFD = std::stoull(argv[2]);
+    // Seek within the fd given using this amount
+    _lseek_setSeekBase(seekInFD);
+    _lseek(fd, 0, SEEK_SET); // Will now be relative to our `seekInFD`
+  }
 
   struct NTFS buf;
   _read(fd, &buf, sizeof(NTFS));
