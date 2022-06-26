@@ -1096,6 +1096,45 @@ int main(int argc, char** argv) {
   _read(fd, &buf, sizeof(NTFS));
   printf("mftOffset: %ju %ju\n", (uintmax_t)buf.mftOffset, (uintmax_t)(buf.mftOffset * buf.bytesPerCluster()));
 
+  if (argc > 3) {
+    const char* cmd = argv[3];
+    // Optional "command"
+    if (strcmp(cmd, "rec") == 0) {
+      // Read record at addr
+      
+      long long seekToAddr;
+      // printf("Enter a number of sectors to seek to in order to grab an MFT record there: ");
+      // int ret = scanf(" %d", &seekToAddr);
+      // if (ret == EOF) {
+      // 	perror("scanf failed");
+      // }
+      // int expected = 1;
+      // if (ret < expected) {
+      // 	printf("Not enough grabbed by scanf (got %d out of %d). Exiting.\n", ret, expected);
+      // 	return 1;
+      // }
+
+      if (argc < 4) {
+	printf("Need another argument. Exiting.\n");
+	return 1;
+      }
+      seekToAddr = std::stoll(argv[4]);
+      // Seek to it and grab an MFT record
+      off_t dest = seekToAddr * buf.bytesPerSector;
+      printf("buf.bytesPerSector: %ju, dest in sectors: %jd dest in bytes: %jd\n", (uintmax_t)buf.bytesPerSector, (intmax_t)seekToAddr, (intmax_t)dest);
+      _lseek(fd, dest, SEEK_SET);
+      MFTRecord buf2;
+      _read(fd, &buf2, sizeof(MFTRecord));
+  
+      BREAKPOINT;
+      return 0;
+    }
+    else {
+      printf("Unknown command\n");
+      return 1;
+    }
+  }
+
   MFTRecord rec = buf.getFirstMFTRecord(fd);
   rec.applyFixup(buf.bytesPerSector);
   printf("numberOfThisMFTRecord: %ju , sequenceNumber: %ju ; fileReferenceAddress of first MFT record: computed %ju stored %ju\n",(uintmax_t)rec.numberOfThisMFTRecord, (uintmax_t)rec.sequenceNumber, (uintmax_t)rec.computedFileReferenceAddress(), (uintmax_t)rec.fileReferenceToTheBase_FILE_record);
@@ -1177,6 +1216,37 @@ int main(int argc, char** argv) {
   size_t bytesLeftOverWithinTheSectorOfVolFlags = bytesFromVolumeStartToVolFlags % buf.bytesPerSector; // Get the bytes remaining within the sector that the $VOLUME_INFORMATION is contained in.
   printf("sectorsFromVolumeStartToVolFlags: %ju, bytesPerSector: %ju, bytesLeftOverWithinTheSectorOfVolFlags: %ju\n", (uintmax_t)sectorsFromVolumeStartToVolFlags, (uintmax_t)buf.bytesPerSector, (uintmax_t)bytesLeftOverWithinTheSectorOfVolFlags);
 
-  //BREAKPOINT;
+  // [wip implementation] Scan the MFT for hiberfil.sys //
+  //findFile(
+
+  // MFTRecord* prevEntry = recordAndBufAndMore_volume.first;
+  // size_t startingRecordNumber = ((uint8_t*)prevEntry - (uint8_t*)data.get()) / buf.bytesPerMFTFileRecord();
+  // printf("Scanning for hiberfil.sys starting at record number %zu\n", startingRecordNumber);
+  // for (size_t i = startingRecordNumber; i < 1000; i++) {
+  //   auto recordAndBufAndMore_mftEntry = prevEntry->next(*data_pair.second, actualContentSize, amountAlreadyLoadedFromMDR, data.release(), &seekedAmount, fd, &buf);
+  //   prevEntry = recordAndBufAndMore_mftEntry.first;
+  //   data.emplace(unique_free<Data>((Data*)recordAndBufAndMore_mftEntry.second.first.release()));
+  //   more = recordAndBufAndMore_mftEntry.second.second;
+  //   actualContentSize += more;
+  //   amountAlreadyLoadedFromMDR += seekedAmount;
+  //   //prevEntry->hexDump();
+  //   prevEntry->applyFixup(buf.bytesPerSector);
+
+  //   // Read from `prevEntry` now:
+  //   // TODO: make limitToLoad, etc. all use the existing buf properly here:
+  //   auto file_name_pair = findAttribute<FileName>(prevEntry->attributes(), FILE_NAME, limitToLoad, &moreNeeded, &more, fd, &buf);
+  //   auto& file_name = file_name_pair.first;
+  //   if (file_name.get() == nullptr) {
+  //     printf("Can't find $FILE_NAME in MFT entry %zu, skipping it.\n", i);
+  //     continue;
+  //   }
+  //   auto arr = file_name->fileNameInUnicode();
+  //   auto str = arr.to_string();
+  //   printf("Found $FILE_NAME in MFT entry %zu with file name: %s\n", i, str.c_str());
+  // }
+
+  // //
+  
+  BREAKPOINT;
   _close(fd);
 }

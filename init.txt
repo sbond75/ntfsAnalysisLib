@@ -3,3 +3,9 @@ define hook-quit
 end
 
 set pagination off
+
+
+# Extras
+# Define offsetof macro for convenience
+# https://stackoverflow.com/questions/39607565/how-to-define-offsetof-macro-in-gdb
+macro define offsetof(t, f) (size_t)&((t *) 0)->f
