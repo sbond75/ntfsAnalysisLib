@@ -21,5 +21,6 @@ mkShell {
     gcc
     gmp
     valgrind
+    gdb
   ];
 }
