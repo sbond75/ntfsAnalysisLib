@@ -782,7 +782,7 @@ struct MFTRecord {
     return *(uint16_t*)((uint8_t*)this + updateSequenceOffset);
   }
 
-  // This array contains actual values to be placed at the last 16-bit word of each sector in this record. (The values in the last 16-bit word of each sector *are* the updateSequenceNumber() unless you change it to what it should be in memory, which is the corresponding value from this fixupArray().)
+  // This array contains update sequence number (usn) followed by the update sequence array (usa). The usa contains the actual values to be placed at the last 16-bit word of each sector in this record. (The values in the last 16-bit word of each sector *are* the updateSequenceNumber() unless you change it to what it should be in memory, which is the corresponding value from this fixupArray().)
   ArrayWithLength<uint16_t> fixupArray() const {
     return {(uint16_t*)((uint8_t*)this + updateSequenceOffset), numEntriesInFixupArray};
   }
@@ -790,6 +790,12 @@ struct MFTRecord {
   // Mutates `this`.
   void applyFixup(uint16_t bytesPerSector) {
     auto arr = fixupArray();
+    // The fixup array comes after the update sequence number (USN) which is the first element of this array
+    if (arr.length > 0) {
+        // Move to the next element since the first element is currently the update sequence number (USN)
+        arr = ArrayWithLength<uint16_t>{arr.array + 1, arr.length - 1};
+    }
+    
     // ntfsdoc-0.6/concepts/fixup.html
     // Last 2 bytes of each sector (each sector is of size 512 bytes usually) must be compared with the updateSequenceNumber() and replaced with the corresponding index from fixupArray().
     uint8_t* sectorIterator = (uint8_t*)this + bytesPerSector - sizeof(uint16_t);
