@@ -801,10 +801,10 @@ struct MFTRecord {
     uint8_t* sectorIterator = (uint8_t*)this + bytesPerSector - sizeof(uint16_t);
     auto usn = updateSequenceNumber();
     for (auto val : arr) {
-      if (sectorIterator > (uint8_t*)this + usedSizeOfMFTEntry) {
-	printf("applyFixup: sectorIterator is past usedSizeOfMFTEntry\n");
-	break;
-      }
+      //if (sectorIterator > (uint8_t*)this + usedSizeOfMFTEntry) {
+      //  printf("applyFixup: sectorIterator is past usedSizeOfMFTEntry\n");
+      //  break;
+      //}
       
       uint16_t* valPtr = (uint16_t*)sectorIterator;
       printf("applyFixup: %ju should be usn %ju", (uintmax_t)*valPtr, (uintmax_t)usn);
